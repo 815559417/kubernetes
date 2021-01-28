@@ -19,13 +19,15 @@ limitations under the License.
 package fake
 
 import (
+	"context"
+
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	labels "k8s.io/apimachinery/pkg/labels"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	types "k8s.io/apimachinery/pkg/types"
 	watch "k8s.io/apimachinery/pkg/watch"
 	testing "k8s.io/client-go/testing"
-	apiregistration_v1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 )
 
 // FakeAPIServices implements APIServiceInterface
@@ -38,19 +40,19 @@ var apiservicesResource = schema.GroupVersionResource{Group: "apiregistration.k8
 var apiservicesKind = schema.GroupVersionKind{Group: "apiregistration.k8s.io", Version: "v1", Kind: "APIService"}
 
 // Get takes name of the aPIService, and returns the corresponding aPIService object, and an error if there is any.
-func (c *FakeAPIServices) Get(name string, options v1.GetOptions) (result *apiregistration_v1.APIService, err error) {
+func (c *FakeAPIServices) Get(ctx context.Context, name string, options v1.GetOptions) (result *apiregistrationv1.APIService, err error) {
 	obj, err := c.Fake.
-		Invokes(testing.NewRootGetAction(apiservicesResource, name), &apiregistration_v1.APIService{})
+		Invokes(testing.NewRootGetAction(apiservicesResource, name), &apiregistrationv1.APIService{})
 	if obj == nil {
 		return nil, err
 	}
-	return obj.(*apiregistration_v1.APIService), err
+	return obj.(*apiregistrationv1.APIService), err
 }
 
 // List takes label and field selectors, and returns the list of APIServices that match those selectors.
-func (c *FakeAPIServices) List(opts v1.ListOptions) (result *apiregistration_v1.APIServiceList, err error) {
+func (c *FakeAPIServices) List(ctx context.Context, opts v1.ListOptions) (result *apiregistrationv1.APIServiceList, err error) {
 	obj, err := c.Fake.
-		Invokes(testing.NewRootListAction(apiservicesResource, apiservicesKind, opts), &apiregistration_v1.APIServiceList{})
+		Invokes(testing.NewRootListAction(apiservicesResource, apiservicesKind, opts), &apiregistrationv1.APIServiceList{})
 	if obj == nil {
 		return nil, err
 	}
@@ -59,8 +61,8 @@ func (c *FakeAPIServices) List(opts v1.ListOptions) (result *apiregistration_v1.
 	if label == nil {
 		label = labels.Everything()
 	}
-	list := &apiregistration_v1.APIServiceList{}
-	for _, item := range obj.(*apiregistration_v1.APIServiceList).Items {
+	list := &apiregistrationv1.APIServiceList{ListMeta: obj.(*apiregistrationv1.APIServiceList).ListMeta}
+	for _, item := range obj.(*apiregistrationv1.APIServiceList).Items {
 		if label.Matches(labels.Set(item.Labels)) {
 			list.Items = append(list.Items, item)
 		}
@@ -69,63 +71,63 @@ func (c *FakeAPIServices) List(opts v1.ListOptions) (result *apiregistration_v1.
 }
 
 // Watch returns a watch.Interface that watches the requested aPIServices.
-func (c *FakeAPIServices) Watch(opts v1.ListOptions) (watch.Interface, error) {
+func (c *FakeAPIServices) Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
 	return c.Fake.
 		InvokesWatch(testing.NewRootWatchAction(apiservicesResource, opts))
 }
 
 // Create takes the representation of a aPIService and creates it.  Returns the server's representation of the aPIService, and an error, if there is any.
-func (c *FakeAPIServices) Create(aPIService *apiregistration_v1.APIService) (result *apiregistration_v1.APIService, err error) {
+func (c *FakeAPIServices) Create(ctx context.Context, aPIService *apiregistrationv1.APIService, opts v1.CreateOptions) (result *apiregistrationv1.APIService, err error) {
 	obj, err := c.Fake.
-		Invokes(testing.NewRootCreateAction(apiservicesResource, aPIService), &apiregistration_v1.APIService{})
+		Invokes(testing.NewRootCreateAction(apiservicesResource, aPIService), &apiregistrationv1.APIService{})
 	if obj == nil {
 		return nil, err
 	}
-	return obj.(*apiregistration_v1.APIService), err
+	return obj.(*apiregistrationv1.APIService), err
 }
 
 // Update takes the representation of a aPIService and updates it. Returns the server's representation of the aPIService, and an error, if there is any.
-func (c *FakeAPIServices) Update(aPIService *apiregistration_v1.APIService) (result *apiregistration_v1.APIService, err error) {
+func (c *FakeAPIServices) Update(ctx context.Context, aPIService *apiregistrationv1.APIService, opts v1.UpdateOptions) (result *apiregistrationv1.APIService, err error) {
 	obj, err := c.Fake.
-		Invokes(testing.NewRootUpdateAction(apiservicesResource, aPIService), &apiregistration_v1.APIService{})
+		Invokes(testing.NewRootUpdateAction(apiservicesResource, aPIService), &apiregistrationv1.APIService{})
 	if obj == nil {
 		return nil, err
 	}
-	return obj.(*apiregistration_v1.APIService), err
+	return obj.(*apiregistrationv1.APIService), err
 }
 
 // UpdateStatus was generated because the type contains a Status member.
 // Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
-func (c *FakeAPIServices) UpdateStatus(aPIService *apiregistration_v1.APIService) (*apiregistration_v1.APIService, error) {
+func (c *FakeAPIServices) UpdateStatus(ctx context.Context, aPIService *apiregistrationv1.APIService, opts v1.UpdateOptions) (*apiregistrationv1.APIService, error) {
 	obj, err := c.Fake.
-		Invokes(testing.NewRootUpdateSubresourceAction(apiservicesResource, "status", aPIService), &apiregistration_v1.APIService{})
+		Invokes(testing.NewRootUpdateSubresourceAction(apiservicesResource, "status", aPIService), &apiregistrationv1.APIService{})
 	if obj == nil {
 		return nil, err
 	}
-	return obj.(*apiregistration_v1.APIService), err
+	return obj.(*apiregistrationv1.APIService), err
 }
 
 // Delete takes name of the aPIService and deletes it. Returns an error if one occurs.
-func (c *FakeAPIServices) Delete(name string, options *v1.DeleteOptions) error {
+func (c *FakeAPIServices) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
 	_, err := c.Fake.
-		Invokes(testing.NewRootDeleteAction(apiservicesResource, name), &apiregistration_v1.APIService{})
+		Invokes(testing.NewRootDeleteAction(apiservicesResource, name), &apiregistrationv1.APIService{})
 	return err
 }
 
 // DeleteCollection deletes a collection of objects.
-func (c *FakeAPIServices) DeleteCollection(options *v1.DeleteOptions, listOptions v1.ListOptions) error {
-	action := testing.NewRootDeleteCollectionAction(apiservicesResource, listOptions)
+func (c *FakeAPIServices) DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error {
+	action := testing.NewRootDeleteCollectionAction(apiservicesResource, listOpts)
 
-	_, err := c.Fake.Invokes(action, &apiregistration_v1.APIServiceList{})
+	_, err := c.Fake.Invokes(action, &apiregistrationv1.APIServiceList{})
 	return err
 }
 
 // Patch applies the patch and returns the patched aPIService.
-func (c *FakeAPIServices) Patch(name string, pt types.PatchType, data []byte, subresources ...string) (result *apiregistration_v1.APIService, err error) {
+func (c *FakeAPIServices) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *apiregistrationv1.APIService, err error) {
 	obj, err := c.Fake.
-		Invokes(testing.NewRootPatchSubresourceAction(apiservicesResource, name, data, subresources...), &apiregistration_v1.APIService{})
+		Invokes(testing.NewRootPatchSubresourceAction(apiservicesResource, name, pt, data, subresources...), &apiregistrationv1.APIService{})
 	if obj == nil {
 		return nil, err
 	}
-	return obj.(*apiregistration_v1.APIService), err
+	return obj.(*apiregistrationv1.APIService), err
 }

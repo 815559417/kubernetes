@@ -17,25 +17,43 @@ limitations under the License.
 package apiserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	apiserverinternalv1alpha1 "k8s.io/api/apiserverinternal/v1alpha1"
 	batchv2alpha1 "k8s.io/api/batch/v2alpha1"
+	discoveryv1alpha1 "k8s.io/api/discovery/v1alpha1"
+	discoveryv1beta1 "k8s.io/api/discovery/v1beta1"
+	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	flowcontrolv1alpha1 "k8s.io/api/flowcontrol/v1alpha1"
+	flowcontrolv1beta1 "k8s.io/api/flowcontrol/v1beta1"
+	nodev1 "k8s.io/api/node/v1"
+	nodev1alpha1 "k8s.io/api/node/v1alpha1"
+	nodev1beta1 "k8s.io/api/node/v1beta1"
 	rbacv1alpha1 "k8s.io/api/rbac/v1alpha1"
-	schedulingv1alpha1 "k8s.io/api/scheduling/v1alpha1"
-	settingsv1alpha1 "k8s.io/api/settings/v1alpha1"
+	schedulerapi "k8s.io/api/scheduling/v1"
 	storagev1alpha1 "k8s.io/api/storage/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	diskcached "k8s.io/client-go/discovery/cached/disk"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/gengo/examples/set-gen/sets"
+	"k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/printers"
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	"k8s.io/kubernetes/test/integration/framework"
@@ -47,10 +65,13 @@ var kindWhiteList = sets.NewString(
 	"APIVersions",
 	"Binding",
 	"DeleteOptions",
+	"EphemeralContainers",
 	"ExportOptions",
 	"GetOptions",
 	"ListOptions",
-	"NodeConfigSource",
+	"CreateOptions",
+	"UpdateOptions",
+	"PatchOptions",
 	"NodeProxyOptions",
 	"PodAttachOptions",
 	"PodExecOptions",
@@ -65,10 +86,6 @@ var kindWhiteList = sets.NewString(
 
 	// k8s.io/api/admission
 	"AdmissionReview",
-	// --
-
-	// k8s.io/api/admissionregistration
-	"InitializerConfiguration",
 	// --
 
 	// k8s.io/api/authentication
@@ -95,20 +112,12 @@ var kindWhiteList = sets.NewString(
 	"JobTemplate",
 	// --
 
-	// k8s.io/api/extensions
-	"ReplicationControllerDummy",
-	// --
-
 	// k8s.io/api/imagepolicy
 	"ImageReview",
 	// --
 
 	// k8s.io/api/policy
 	"Eviction",
-	// --
-
-	// k8s.io/kubernetes/pkg/apis/componentconfig
-	"KubeSchedulerConfiguration",
 	// --
 
 	// k8s.io/apimachinery/pkg/apis/meta
@@ -121,23 +130,57 @@ var kindWhiteList = sets.NewString(
 var missingHanlders = sets.NewString(
 	"ClusterRole",
 	"LimitRange",
-	"MutatingWebhookConfiguration",
 	"ResourceQuota",
 	"Role",
-	"ValidatingWebhookConfiguration",
-	"VolumeAttachment",
 	"PriorityClass",
 	"PodPreset",
+	"AuditSink",
 )
 
+// known types that are no longer served we should tolerate restmapper errors for
+var unservedTypes = map[schema.GroupVersionKind]bool{
+	{Group: "extensions", Version: "v1beta1", Kind: "ControllerRevision"}: true,
+	{Group: "extensions", Version: "v1beta1", Kind: "DaemonSet"}:          true,
+	{Group: "extensions", Version: "v1beta1", Kind: "Deployment"}:         true,
+	{Group: "extensions", Version: "v1beta1", Kind: "NetworkPolicy"}:      true,
+	{Group: "extensions", Version: "v1beta1", Kind: "PodSecurityPolicy"}:  true,
+	{Group: "extensions", Version: "v1beta1", Kind: "ReplicaSet"}:         true,
+
+	{Group: "apps", Version: "v1beta1", Kind: "ControllerRevision"}: true,
+	{Group: "apps", Version: "v1beta1", Kind: "DaemonSet"}:          true,
+	{Group: "apps", Version: "v1beta1", Kind: "Deployment"}:         true,
+	{Group: "apps", Version: "v1beta1", Kind: "ReplicaSet"}:         true,
+	{Group: "apps", Version: "v1beta1", Kind: "StatefulSet"}:        true,
+
+	{Group: "apps", Version: "v1beta2", Kind: "ControllerRevision"}: true,
+	{Group: "apps", Version: "v1beta2", Kind: "DaemonSet"}:          true,
+	{Group: "apps", Version: "v1beta2", Kind: "Deployment"}:         true,
+	{Group: "apps", Version: "v1beta2", Kind: "ReplicaSet"}:         true,
+	{Group: "apps", Version: "v1beta2", Kind: "StatefulSet"}:        true,
+}
+
 func TestServerSidePrint(t *testing.T) {
-	s, _, closeFn := setup(t,
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIStorageCapacity, true)()
+
+	s, _, closeFn := setupWithResources(t,
 		// additional groupversions needed for the test to run
-		batchv2alpha1.SchemeGroupVersion,
-		rbacv1alpha1.SchemeGroupVersion,
-		settingsv1alpha1.SchemeGroupVersion,
-		schedulingv1alpha1.SchemeGroupVersion,
-		storagev1alpha1.SchemeGroupVersion)
+		[]schema.GroupVersion{
+			batchv2alpha1.SchemeGroupVersion,
+			discoveryv1alpha1.SchemeGroupVersion,
+			discoveryv1beta1.SchemeGroupVersion,
+			rbacv1alpha1.SchemeGroupVersion,
+			schedulerapi.SchemeGroupVersion,
+			storagev1alpha1.SchemeGroupVersion,
+			extensionsv1beta1.SchemeGroupVersion,
+			nodev1.SchemeGroupVersion,
+			nodev1alpha1.SchemeGroupVersion,
+			nodev1beta1.SchemeGroupVersion,
+			flowcontrolv1alpha1.SchemeGroupVersion,
+			flowcontrolv1beta1.SchemeGroupVersion,
+			apiserverinternalv1alpha1.SchemeGroupVersion,
+		},
+		[]schema.GroupVersionResource{},
+	)
 	defer closeFn()
 
 	ns := framework.CreateTestingNamespace("server-print", s, t)
@@ -146,9 +189,35 @@ func TestServerSidePrint(t *testing.T) {
 	tableParam := fmt.Sprintf("application/json;as=Table;g=%s;v=%s, application/json", metav1beta1.GroupName, metav1beta1.SchemeGroupVersion.Version)
 	printer := newFakePrinter(printersinternal.AddHandlers)
 
-	factory := util.NewFactory(clientcmd.NewDefaultClientConfig(*createKubeConfig(s.URL), &clientcmd.ConfigOverrides{}))
-	mapper, _ := factory.Object()
+	configFlags := genericclioptions.NewTestConfigFlags().
+		WithClientConfig(clientcmd.NewDefaultClientConfig(*createKubeConfig(s.URL), &clientcmd.ConfigOverrides{}))
 
+	restConfig, err := configFlags.ToRESTConfig()
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	cacheDir, err := ioutil.TempDir(os.TempDir(), "test-integration-apiserver-print")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	defer func() {
+		os.Remove(cacheDir)
+	}()
+
+	cachedClient, err := diskcached.NewCachedDiscoveryClientForConfig(restConfig, cacheDir, "", time.Duration(10*time.Minute))
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	configFlags.WithDiscoveryClient(cachedClient)
+
+	factory := util.NewFactory(configFlags)
+	mapper, err := factory.ToRESTMapper()
+	if err != nil {
+		t.Errorf("unexpected error getting mapper: %v", err)
+		return
+	}
 	for gvk, apiType := range legacyscheme.Scheme.AllKnownTypes() {
 		// we do not care about internal objects or lists // TODO make sure this is always true
 		if gvk.Version == runtime.APIVersionInternal || strings.HasSuffix(apiType.Name(), "List") {
@@ -162,6 +231,9 @@ func TestServerSidePrint(t *testing.T) {
 		// read table definition as returned by the server
 		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 		if err != nil {
+			if unservedTypes[gvk] {
+				continue
+			}
 			t.Errorf("unexpected error getting mapping for GVK %s: %v", gvk, err)
 			continue
 		}
@@ -174,7 +246,7 @@ func TestServerSidePrint(t *testing.T) {
 		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
 			req = req.Namespace(ns.Name)
 		}
-		body, err := req.Resource(mapping.Resource).SetHeader("Accept", tableParam).Do().Raw()
+		body, err := req.Resource(mapping.Resource.Resource).SetHeader("Accept", tableParam).Do(context.TODO()).Raw()
 		if err != nil {
 			t.Errorf("unexpected error getting %s: %v", gvk, err)
 			continue
@@ -192,7 +264,7 @@ func TestServerSidePrint(t *testing.T) {
 			continue
 		}
 		intGV := gvk.GroupKind().WithVersion(runtime.APIVersionInternal).GroupVersion()
-		intObj, err := mapping.ConvertToVersion(obj, intGV)
+		intObj, err := legacyscheme.Scheme.ConvertToVersion(obj, intGV)
 		if err != nil {
 			t.Errorf("unexpected error converting %s to internal: %v", gvk, err)
 			continue

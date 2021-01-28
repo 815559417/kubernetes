@@ -17,20 +17,26 @@ limitations under the License.
 package metrics
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
-	autoscaling "k8s.io/api/autoscaling/v2beta1"
+	autoscaling "k8s.io/api/autoscaling/v2beta2"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	customapi "k8s.io/metrics/pkg/apis/custom_metrics/v1beta1"
-	resourceclient "k8s.io/metrics/pkg/client/clientset_generated/clientset/typed/metrics/v1beta1"
+	customapi "k8s.io/metrics/pkg/apis/custom_metrics/v1beta2"
+	metricsapi "k8s.io/metrics/pkg/apis/metrics/v1beta1"
+	resourceclient "k8s.io/metrics/pkg/client/clientset/versioned/typed/metrics/v1beta1"
 	customclient "k8s.io/metrics/pkg/client/custom_metrics"
 	externalclient "k8s.io/metrics/pkg/client/external_metrics"
+)
+
+const (
+	metricServerDefaultMetricWindow = time.Minute
 )
 
 func NewRESTMetricsClient(resourceClient resourceclient.PodMetricsesGetter, customClient customclient.CustomMetricsClient, externalClient externalclient.ExternalMetricsClient) MetricsClient {
@@ -58,8 +64,8 @@ type resourceMetricsClient struct {
 
 // GetResourceMetric gets the given resource metric (and an associated oldest timestamp)
 // for all pods matching the specified selector in the given namespace
-func (c *resourceMetricsClient) GetResourceMetric(resource v1.ResourceName, namespace string, selector labels.Selector) (PodMetricsInfo, time.Time, error) {
-	metrics, err := c.client.PodMetricses(namespace).List(metav1.ListOptions{LabelSelector: selector.String()})
+func (c *resourceMetricsClient) GetResourceMetric(resource v1.ResourceName, namespace string, selector labels.Selector, container string) (PodMetricsInfo, time.Time, error) {
+	metrics, err := c.client.PodMetricses(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String()})
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("unable to fetch metrics from resource metrics API: %v", err)
 	}
@@ -67,30 +73,66 @@ func (c *resourceMetricsClient) GetResourceMetric(resource v1.ResourceName, name
 	if len(metrics.Items) == 0 {
 		return nil, time.Time{}, fmt.Errorf("no metrics returned from resource metrics API")
 	}
+	var res PodMetricsInfo
+	if container != "" {
+		res, err = getContainerMetrics(metrics.Items, resource, container)
+		if err != nil {
+			return nil, time.Time{}, fmt.Errorf("failed to get container metrics: %v", err)
+		}
+	} else {
+		res = getPodMetrics(metrics.Items, resource)
+	}
+	timestamp := metrics.Items[0].Timestamp.Time
+	return res, timestamp, nil
+}
 
-	res := make(PodMetricsInfo, len(metrics.Items))
+func getContainerMetrics(rawMetrics []metricsapi.PodMetrics, resource v1.ResourceName, container string) (PodMetricsInfo, error) {
+	res := make(PodMetricsInfo, len(rawMetrics))
+	for _, m := range rawMetrics {
+		containerFound := false
+		for _, c := range m.Containers {
+			if c.Name == container {
+				containerFound = true
+				if val, resFound := c.Usage[resource]; resFound {
+					res[m.Name] = PodMetric{
+						Timestamp: m.Timestamp.Time,
+						Window:    m.Window.Duration,
+						Value:     val.MilliValue(),
+					}
+				}
+				break
+			}
+		}
+		if !containerFound {
+			return nil, fmt.Errorf("container %s not present in metrics for pod %s/%s", container, m.Namespace, m.Name)
+		}
+	}
+	return res, nil
+}
 
-	for _, m := range metrics.Items {
+func getPodMetrics(rawMetrics []metricsapi.PodMetrics, resource v1.ResourceName) PodMetricsInfo {
+	res := make(PodMetricsInfo, len(rawMetrics))
+	for _, m := range rawMetrics {
 		podSum := int64(0)
 		missing := len(m.Containers) == 0
 		for _, c := range m.Containers {
-			resValue, found := c.Usage[v1.ResourceName(resource)]
+			resValue, found := c.Usage[resource]
 			if !found {
 				missing = true
-				glog.V(2).Infof("missing resource metric %v for container %s in pod %s/%s", resource, c.Name, namespace, m.Name)
-				break // containers loop
+				klog.V(2).Infof("missing resource metric %v for %s/%s", resource, m.Namespace, m.Name)
+				break
 			}
 			podSum += resValue.MilliValue()
 		}
-
 		if !missing {
-			res[m.Name] = int64(podSum)
+			res[m.Name] = PodMetric{
+				Timestamp: m.Timestamp.Time,
+				Window:    m.Window.Duration,
+				Value:     podSum,
+			}
 		}
 	}
-
-	timestamp := metrics.Items[0].Timestamp.Time
-
-	return res, timestamp, nil
+	return res
 }
 
 // customMetricsClient implements the custom-metrics-related parts of MetricsClient,
@@ -101,8 +143,8 @@ type customMetricsClient struct {
 
 // GetRawMetric gets the given metric (and an associated oldest timestamp)
 // for all pods matching the specified selector in the given namespace
-func (c *customMetricsClient) GetRawMetric(metricName string, namespace string, selector labels.Selector) (PodMetricsInfo, time.Time, error) {
-	metrics, err := c.client.NamespacedMetrics(namespace).GetForObjects(schema.GroupKind{Kind: "Pod"}, selector, metricName)
+func (c *customMetricsClient) GetRawMetric(metricName string, namespace string, selector labels.Selector, metricSelector labels.Selector) (PodMetricsInfo, time.Time, error) {
+	metrics, err := c.client.NamespacedMetrics(namespace).GetForObjects(schema.GroupKind{Kind: "Pod"}, selector, metricName, metricSelector)
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("unable to fetch metrics from custom metrics API: %v", err)
 	}
@@ -113,7 +155,17 @@ func (c *customMetricsClient) GetRawMetric(metricName string, namespace string, 
 
 	res := make(PodMetricsInfo, len(metrics.Items))
 	for _, m := range metrics.Items {
-		res[m.DescribedObject.Name] = m.Value.MilliValue()
+		window := metricServerDefaultMetricWindow
+		if m.WindowSeconds != nil {
+			window = time.Duration(*m.WindowSeconds) * time.Second
+		}
+		res[m.DescribedObject.Name] = PodMetric{
+			Timestamp: m.Timestamp.Time,
+			Window:    window,
+			Value:     int64(m.Value.MilliValue()),
+		}
+
+		m.Value.MilliValue()
 	}
 
 	timestamp := metrics.Items[0].Timestamp.Time
@@ -123,7 +175,7 @@ func (c *customMetricsClient) GetRawMetric(metricName string, namespace string, 
 
 // GetObjectMetric gets the given metric (and an associated timestamp) for the given
 // object in the given namespace
-func (c *customMetricsClient) GetObjectMetric(metricName string, namespace string, objectRef *autoscaling.CrossVersionObjectReference) (int64, time.Time, error) {
+func (c *customMetricsClient) GetObjectMetric(metricName string, namespace string, objectRef *autoscaling.CrossVersionObjectReference, metricSelector labels.Selector) (int64, time.Time, error) {
 	gvk := schema.FromAPIVersionAndKind(objectRef.APIVersion, objectRef.Kind)
 	var metricValue *customapi.MetricValue
 	var err error
@@ -131,9 +183,9 @@ func (c *customMetricsClient) GetObjectMetric(metricName string, namespace strin
 		// handle namespace separately
 		// NB: we ignore namespace name here, since CrossVersionObjectReference isn't
 		// supposed to allow you to escape your namespace
-		metricValue, err = c.client.RootScopedMetrics().GetForObject(gvk.GroupKind(), namespace, metricName)
+		metricValue, err = c.client.RootScopedMetrics().GetForObject(gvk.GroupKind(), namespace, metricName, metricSelector)
 	} else {
-		metricValue, err = c.client.NamespacedMetrics(namespace).GetForObject(gvk.GroupKind(), objectRef.Name, metricName)
+		metricValue, err = c.client.NamespacedMetrics(namespace).GetForObject(gvk.GroupKind(), objectRef.Name, metricName, metricSelector)
 	}
 
 	if err != nil {
@@ -143,7 +195,7 @@ func (c *customMetricsClient) GetObjectMetric(metricName string, namespace strin
 	return metricValue.Value.MilliValue(), metricValue.Timestamp.Time, nil
 }
 
-// externalMetricsClient implenets the external metrics related parts of MetricsClient,
+// externalMetricsClient implements the external metrics related parts of MetricsClient,
 // using data from the external metrics API.
 type externalMetricsClient struct {
 	client externalclient.ExternalMetricsClient

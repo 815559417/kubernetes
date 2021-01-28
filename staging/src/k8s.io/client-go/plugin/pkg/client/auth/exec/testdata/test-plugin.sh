@@ -1,4 +1,4 @@
-#!/bin/sh -e
+#!/bin/bash -e
 
 # Copyright 2018 The Kubernetes Authors.
 #
@@ -16,3 +16,4 @@
 
 >&2 echo "$KUBERNETES_EXEC_INFO"
 echo "$TEST_OUTPUT"
+exit "${TEST_EXIT_CODE:-0}"

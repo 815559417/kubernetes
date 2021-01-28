@@ -18,6 +18,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -27,9 +28,9 @@ import (
 	"path"
 	"strings"
 
-	"github.com/golang/glog"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
+	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -100,12 +101,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := rt.RoundTrip(req)
 
 	if err != nil {
-		message := fmt.Sprintf("Error: '%s'\nTrying to reach: '%v'", err.Error(), req.URL.String())
-		resp = &http.Response{
-			StatusCode: http.StatusServiceUnavailable,
-			Body:       ioutil.NopCloser(strings.NewReader(message)),
-		}
-		return resp, nil
+		return nil, fmt.Errorf("error trying to reach service: %w", err)
 	}
 
 	if redirect := resp.Header.Get("Location"); redirect != "" {
@@ -231,12 +227,23 @@ func (t *Transport) rewriteResponse(req *http.Request, resp *http.Response) (*ht
 		gzw := gzip.NewWriter(writer)
 		defer gzw.Close()
 		writer = gzw
-	// TODO: support flate, other encodings.
+	case "deflate":
+		var err error
+		reader = flate.NewReader(reader)
+		flw, err := flate.NewWriter(writer, flate.BestCompression)
+		if err != nil {
+			return nil, fmt.Errorf("errorf making flate writer: %v", err)
+		}
+		defer func() {
+			flw.Close()
+			flw.Flush()
+		}()
+		writer = flw
 	case "":
 		// This is fine
 	default:
 		// Some encoding we don't understand-- don't try to parse this
-		glog.Errorf("Proxy encountered encoding %v for text/html; can't understand this so not fixing links.", encoding)
+		klog.Errorf("Proxy encountered encoding %v for text/html; can't understand this so not fixing links.", encoding)
 		return resp, nil
 	}
 
@@ -245,7 +252,7 @@ func (t *Transport) rewriteResponse(req *http.Request, resp *http.Response) (*ht
 	}
 	err := rewriteHTML(reader, writer, urlRewriter)
 	if err != nil {
-		glog.Errorf("Failed to rewrite URLs: %v", err)
+		klog.Errorf("Failed to rewrite URLs: %v", err)
 		return resp, err
 	}
 

@@ -18,53 +18,66 @@ package services
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net"
+
+	"k8s.io/apiserver/pkg/storage/storagebackend"
 
 	apiserver "k8s.io/kubernetes/cmd/kube-apiserver/app"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	"k8s.io/kubernetes/test/e2e/framework"
 )
 
-const (
-	clusterIPRange          = "10.0.0.1/24"
-	apiserverClientURL      = "http://localhost:8080"
-	apiserverHealthCheckURL = apiserverClientURL + "/healthz"
-)
+const clusterIPRange = "10.0.0.1/24"
 
 // APIServer is a server which manages apiserver.
-type APIServer struct{}
+type APIServer struct {
+	storageConfig storagebackend.Config
+	stopCh        chan struct{}
+}
 
 // NewAPIServer creates an apiserver.
-func NewAPIServer() *APIServer {
-	return &APIServer{}
+func NewAPIServer(storageConfig storagebackend.Config) *APIServer {
+	return &APIServer{
+		storageConfig: storageConfig,
+		stopCh:        make(chan struct{}),
+	}
 }
 
 // Start starts the apiserver, returns when apiserver is ready.
 func (a *APIServer) Start() error {
-	config := options.NewServerRunOptions()
-	config.Etcd.StorageConfig.ServerList = []string{getEtcdClientURL()}
-	// TODO: Current setup of etcd in e2e-node tests doesn't support etcd v3
-	// protocol. We should migrate it to use the same infrastructure as all
-	// other tests (pkg/storage/etcd/testing).
-	config.Etcd.StorageConfig.Type = "etcd2"
+	const tokenFilePath = "known_tokens.csv"
+
+	o := options.NewServerRunOptions()
+	o.Etcd.StorageConfig = a.storageConfig
 	_, ipnet, err := net.ParseCIDR(clusterIPRange)
 	if err != nil {
 		return err
 	}
-	config.ServiceClusterIPRange = *ipnet
-	config.AllowPrivileged = true
-	config.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+	o.SecureServing.BindAddress = net.ParseIP("127.0.0.1")
+	o.ServiceClusterIPRanges = ipnet.String()
+	o.AllowPrivileged = true
+	if err := generateTokenFile(tokenFilePath); err != nil {
+		return fmt.Errorf("failed to generate token file %s: %v", tokenFilePath, err)
+	}
+	o.Authentication.TokenFile.TokenFile = tokenFilePath
+	o.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount", "TaintNodesByCondition"}
 	errCh := make(chan error)
 	go func() {
 		defer close(errCh)
-		stopCh := make(chan struct{})
-		defer close(stopCh)
-		err := apiserver.Run(config, stopCh)
+		completedOptions, err := apiserver.Complete(o)
+		if err != nil {
+			errCh <- fmt.Errorf("set apiserver default options error: %v", err)
+			return
+		}
+		err = apiserver.Run(completedOptions, a.stopCh)
 		if err != nil {
 			errCh <- fmt.Errorf("run apiserver error: %v", err)
+			return
 		}
 	}()
 
-	err = readinessCheck("apiserver", []string{apiserverHealthCheckURL}, errCh)
+	err = readinessCheck("apiserver", []string{getAPIServerHealthCheckURL()}, errCh)
 	if err != nil {
 		return err
 	}
@@ -74,19 +87,29 @@ func (a *APIServer) Start() error {
 // Stop stops the apiserver. Currently, there is no way to stop the apiserver.
 // The function is here only for completion.
 func (a *APIServer) Stop() error {
+	if a.stopCh != nil {
+		close(a.stopCh)
+		a.stopCh = nil
+	}
 	return nil
 }
 
 const apiserverName = "apiserver"
 
+// Name returns the name of APIServer.
 func (a *APIServer) Name() string {
 	return apiserverName
 }
 
 func getAPIServerClientURL() string {
-	return apiserverClientURL
+	return framework.TestContext.Host
 }
 
 func getAPIServerHealthCheckURL() string {
-	return apiserverHealthCheckURL
+	return framework.TestContext.Host + "/healthz"
+}
+
+func generateTokenFile(tokenFilePath string) error {
+	tokenFile := fmt.Sprintf("%s,kubelet,uid,system:masters\n", framework.TestContext.BearerToken)
+	return ioutil.WriteFile(tokenFilePath, []byte(tokenFile), 0644)
 }

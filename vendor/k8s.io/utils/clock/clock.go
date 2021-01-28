@@ -18,11 +18,18 @@ package clock
 
 import "time"
 
+// PassiveClock allows for injecting fake or real clocks into code
+// that needs to read the current time but does not support scheduling
+// activity in the future.
+type PassiveClock interface {
+	Now() time.Time
+	Since(time.Time) time.Duration
+}
+
 // Clock allows for injecting fake or real clocks into code that
 // needs to do arbitrary things based on time.
 type Clock interface {
-	Now() time.Time
-	Since(time.Time) time.Duration
+	PassiveClock
 	After(d time.Duration) <-chan time.Time
 	NewTimer(d time.Duration) Timer
 	Sleep(d time.Duration)
@@ -44,21 +51,24 @@ func (RealClock) Since(ts time.Time) time.Duration {
 	return time.Since(ts)
 }
 
-// Same as time.After(d).
+// After is the same as time.After(d).
 func (RealClock) After(d time.Duration) <-chan time.Time {
 	return time.After(d)
 }
 
+// NewTimer is the same as time.NewTimer(d)
 func (RealClock) NewTimer(d time.Duration) Timer {
 	return &realTimer{
 		timer: time.NewTimer(d),
 	}
 }
 
+// Tick is the same as time.Tick(d)
 func (RealClock) Tick(d time.Duration) <-chan time.Time {
 	return time.Tick(d)
 }
 
+// Sleep is the same as time.Sleep(d)
 func (RealClock) Sleep(d time.Duration) {
 	time.Sleep(d)
 }

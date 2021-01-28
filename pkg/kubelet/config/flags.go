@@ -17,13 +17,15 @@ limitations under the License.
 package config
 
 import (
+	"fmt"
+
 	"github.com/spf13/pflag"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ContainerRuntimeOptions defines options for the container runtime.
 type ContainerRuntimeOptions struct {
-
-	// General options.
+	// General Options.
 
 	// ContainerRuntime is the container runtime to use.
 	ContainerRuntime string
@@ -35,13 +37,6 @@ type ContainerRuntimeOptions struct {
 	// DockershimRootDirectory is the path to the dockershim root directory. Defaults to
 	// /var/lib/dockershim if unset. Exposed for integration testing (e.g. in OpenShift).
 	DockershimRootDirectory string
-	// Enable dockershim only mode.
-	ExperimentalDockershim bool
-	// This flag, if set, disables use of a shared PID namespace for pods running in the docker CRI runtime.
-	// A shared PID namespace is the only option in non-docker runtimes and is required by the CRI. The ability to
-	// disable it for docker will be removed unless a compelling use case is discovered with widespread use.
-	// TODO: Remove once we no longer support disabling shared PID namespace (https://issues.k8s.io/41938)
-	DockerDisableSharedPID bool
 	// PodSandboxImage is the image whose network/ipc namespaces
 	// containers in each pod will use.
 	PodSandboxImage string
@@ -67,45 +62,50 @@ type ContainerRuntimeOptions struct {
 	// CNIBinDir is the full path of the directory in which to search for
 	// CNI plugin binaries
 	CNIBinDir string
+	// CNICacheDir is the full path of the directory in which CNI should store
+	// cache files
+	CNICacheDir string
 
-	// rkt-specific options.
+	// Image credential provider plugin options
 
-	// rktPath is the path of rkt binary. Leave empty to use the first rkt in $PATH.
-	RktPath string
-	// rktApiEndpoint is the endpoint of the rkt API service to communicate with.
-	RktAPIEndpoint string
-	// rktStage1Image is the image to use as stage1. Local paths and
-	// http/https URLs are supported.
-	RktStage1Image string
+	// ImageCredentialProviderConfigFile is the path to the credential provider plugin config file.
+	// This config file is a specification for what credential providers are enabled and invokved
+	// by the kubelet. The plugin config should contain information about what plugin binary
+	// to execute and what container images the plugin should be called for.
+	// +optional
+	ImageCredentialProviderConfigFile string
+	// ImageCredentialProviderBinDir is the path to the directory where credential provider plugin
+	// binaries exist. The name of each plugin binary is expected to match the name of the plugin
+	// specified in imageCredentialProviderConfigFile.
+	// +optional
+	ImageCredentialProviderBinDir string
 }
 
+// AddFlags adds flags to the container runtime, according to ContainerRuntimeOptions.
 func (s *ContainerRuntimeOptions) AddFlags(fs *pflag.FlagSet) {
+	dockerOnlyWarning := "This docker-specific flag only works when container-runtime is set to docker."
+
 	// General settings.
-	fs.StringVar(&s.ContainerRuntime, "container-runtime", s.ContainerRuntime, "The container runtime to use. Possible values: 'docker', 'remote', 'rkt (deprecated)'.")
+	fs.StringVar(&s.ContainerRuntime, "container-runtime", s.ContainerRuntime, "The container runtime to use. Possible values: 'docker', 'remote'.")
 	fs.StringVar(&s.RuntimeCgroups, "runtime-cgroups", s.RuntimeCgroups, "Optional absolute name of cgroups to create and run the runtime in.")
+	_ = fs.Bool("redirect-container-streaming", false, "[REMOVED]") // TODO: Delete in v1.22
+	fs.MarkDeprecated("redirect-container-streaming", "Container streaming redirection has been removed from the kubelet as of v1.20, and this flag will be removed in v1.22. For more details, see http://git.k8s.io/enhancements/keps/sig-node/20191205-container-streaming-requests.md")
 
 	// Docker-specific settings.
-	fs.BoolVar(&s.ExperimentalDockershim, "experimental-dockershim", s.ExperimentalDockershim, "Enable dockershim only mode. In this mode, kubelet will only start dockershim without any other functionalities. This flag only serves test purpose, please do not use it unless you are conscious of what you are doing. [default=false]")
-	fs.MarkHidden("experimental-dockershim")
 	fs.StringVar(&s.DockershimRootDirectory, "experimental-dockershim-root-directory", s.DockershimRootDirectory, "Path to the dockershim root directory.")
 	fs.MarkHidden("experimental-dockershim-root-directory")
-	fs.BoolVar(&s.DockerDisableSharedPID, "docker-disable-shared-pid", s.DockerDisableSharedPID, "Setting this to false causes Kubernetes to create pods using a shared process namespace for containers in a pod when running with Docker 1.13.1 or higher. A future Kubernetes release will make this configurable instead in the API.")
-	fs.MarkDeprecated("docker-disable-shared-pid", "will be removed in a future release. This option will be replaced by PID namespace sharing that is configurable per-pod using the API. See https://features.k8s.io/495")
-	fs.StringVar(&s.PodSandboxImage, "pod-infra-container-image", s.PodSandboxImage, "The image whose network/ipc namespaces containers in each pod will use.")
-	fs.StringVar(&s.DockerEndpoint, "docker-endpoint", s.DockerEndpoint, "Use this for the docker endpoint to communicate with")
-	fs.DurationVar(&s.ImagePullProgressDeadline.Duration, "image-pull-progress-deadline", s.ImagePullProgressDeadline.Duration, "If no pulling progress is made before this deadline, the image pulling will be cancelled.")
+	fs.StringVar(&s.PodSandboxImage, "pod-infra-container-image", s.PodSandboxImage, fmt.Sprintf("The image whose network/ipc namespaces containers in each pod will use. %s", dockerOnlyWarning))
+	fs.StringVar(&s.DockerEndpoint, "docker-endpoint", s.DockerEndpoint, fmt.Sprintf("Use this for the docker endpoint to communicate with. %s", dockerOnlyWarning))
+	fs.DurationVar(&s.ImagePullProgressDeadline.Duration, "image-pull-progress-deadline", s.ImagePullProgressDeadline.Duration, fmt.Sprintf("If no pulling progress is made before this deadline, the image pulling will be cancelled. %s", dockerOnlyWarning))
 
-	// Network plugin settings. Shared by both docker and rkt.
-	fs.StringVar(&s.NetworkPluginName, "network-plugin", s.NetworkPluginName, "<Warning: Alpha feature> The name of the network plugin to be invoked for various events in kubelet/pod lifecycle")
-	fs.StringVar(&s.CNIConfDir, "cni-conf-dir", s.CNIConfDir, "<Warning: Alpha feature> The full path of the directory in which to search for CNI config files. Default: /etc/cni/net.d")
-	fs.StringVar(&s.CNIBinDir, "cni-bin-dir", s.CNIBinDir, "<Warning: Alpha feature> A comma-separated list of full paths of directories in which to search for CNI plugin binaries. Default: /opt/cni/bin")
-	fs.Int32Var(&s.NetworkPluginMTU, "network-plugin-mtu", s.NetworkPluginMTU, "<Warning: Alpha feature> The MTU to be passed to the network plugin, to override the default. Set to 0 to use the default 1460 MTU.")
+	// Network plugin settings for Docker.
+	fs.StringVar(&s.NetworkPluginName, "network-plugin", s.NetworkPluginName, fmt.Sprintf("The name of the network plugin to be invoked for various events in kubelet/pod lifecycle. %s", dockerOnlyWarning))
+	fs.StringVar(&s.CNIConfDir, "cni-conf-dir", s.CNIConfDir, fmt.Sprintf("The full path of the directory in which to search for CNI config files. %s", dockerOnlyWarning))
+	fs.StringVar(&s.CNIBinDir, "cni-bin-dir", s.CNIBinDir, fmt.Sprintf("A comma-separated list of full paths of directories in which to search for CNI plugin binaries. %s", dockerOnlyWarning))
+	fs.StringVar(&s.CNICacheDir, "cni-cache-dir", s.CNICacheDir, fmt.Sprintf("The full path of the directory in which CNI should store cache files. %s", dockerOnlyWarning))
+	fs.Int32Var(&s.NetworkPluginMTU, "network-plugin-mtu", s.NetworkPluginMTU, fmt.Sprintf("The MTU to be passed to the network plugin, to override the default. Set to 0 to use the default 1460 MTU. %s", dockerOnlyWarning))
 
-	// Rkt-specific settings.
-	fs.StringVar(&s.RktPath, "rkt-path", s.RktPath, "Path of rkt binary. Leave empty to use the first rkt in $PATH.  Only used if --container-runtime='rkt'.")
-	fs.MarkDeprecated("rkt-path", "will be removed in a future version. Rktnetes has been deprecated in favor of rktlet (https://github.com/kubernetes-incubator/rktlet).")
-	fs.StringVar(&s.RktAPIEndpoint, "rkt-api-endpoint", s.RktAPIEndpoint, "The endpoint of the rkt API service to communicate with. Only used if --container-runtime='rkt'.")
-	fs.MarkDeprecated("rkt-api-endpoint", "will be removed in a future version. Rktnetes has been deprecated in favor of rktlet (https://github.com/kubernetes-incubator/rktlet).")
-	fs.StringVar(&s.RktStage1Image, "rkt-stage1-image", s.RktStage1Image, "image to use as stage1. Local paths and http/https URLs are supported. If empty, the 'stage1.aci' in the same directory as '--rkt-path' will be used.")
-	fs.MarkDeprecated("rkt-stage1-image", "will be removed in a future version. Rktnetes has been deprecated in favor of rktlet (https://github.com/kubernetes-incubator/rktlet).")
+	// Image credential provider settings.
+	fs.StringVar(&s.ImageCredentialProviderConfigFile, "image-credential-provider-config", s.ImageCredentialProviderConfigFile, "The path to the credential provider plugin config file.")
+	fs.StringVar(&s.ImageCredentialProviderBinDir, "image-credential-provider-bin-dir", s.ImageCredentialProviderBinDir, "The path to the directory where credential provider plugin binaries are located.")
 }

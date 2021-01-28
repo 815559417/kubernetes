@@ -21,17 +21,18 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/golang/glog"
 	"golang.org/x/net/context"
+	"k8s.io/klog/v2"
 
 	"github.com/google/cadvisor/container"
 	"github.com/google/cadvisor/container/libcontainer"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
-	"github.com/google/cadvisor/manager/watcher"
+	"github.com/google/cadvisor/watcher"
 )
 
-var ArgContainerdEndpoint = flag.String("containerd", "unix:///var/run/containerd.sock", "containerd endpoint")
+var ArgContainerdEndpoint = flag.String("containerd", "/run/containerd/containerd.sock", "containerd endpoint")
+var ArgContainerdNamespace = flag.String("containerd-namespace", "k8s.io", "containerd namespace")
 
 // The namespace under which containerd aliases are unique.
 const k8sContainerdNamespace = "containerd"
@@ -42,21 +43,21 @@ var containerdCgroupRegexp = regexp.MustCompile(`([a-z0-9]{64})`)
 
 type containerdFactory struct {
 	machineInfoFactory info.MachineInfoFactory
-	client             containerdClient
+	client             ContainerdClient
 	version            string
 	// Information about the mounted cgroup subsystems.
 	cgroupSubsystems libcontainer.CgroupSubsystems
 	// Information about mounted filesystems.
-	fsInfo        fs.FsInfo
-	ignoreMetrics container.MetricSet
+	fsInfo          fs.FsInfo
+	includedMetrics container.MetricSet
 }
 
-func (self *containerdFactory) String() string {
+func (f *containerdFactory) String() string {
 	return k8sContainerdNamespace
 }
 
-func (self *containerdFactory) NewContainerHandler(name string, inHostNamespace bool) (handler container.ContainerHandler, err error) {
-	client, err := Client()
+func (f *containerdFactory) NewContainerHandler(name string, inHostNamespace bool) (handler container.ContainerHandler, err error) {
+	client, err := Client(*ArgContainerdEndpoint, *ArgContainerdNamespace)
 	if err != nil {
 		return
 	}
@@ -65,12 +66,12 @@ func (self *containerdFactory) NewContainerHandler(name string, inHostNamespace 
 	return newContainerdContainerHandler(
 		client,
 		name,
-		self.machineInfoFactory,
-		self.fsInfo,
-		&self.cgroupSubsystems,
+		f.machineInfoFactory,
+		f.fsInfo,
+		&f.cgroupSubsystems,
 		inHostNamespace,
 		metadataEnvs,
-		self.ignoreMetrics,
+		f.includedMetrics,
 	)
 }
 
@@ -94,7 +95,7 @@ func isContainerName(name string) bool {
 }
 
 // Containerd can handle and accept all containerd created containers
-func (self *containerdFactory) CanHandleAndAccept(name string) (bool, bool, error) {
+func (f *containerdFactory) CanHandleAndAccept(name string) (bool, bool, error) {
 	// if the container is not associated with containerd, we can't handle it or accept it.
 	if !isContainerName(name) {
 		return false, false, nil
@@ -104,7 +105,7 @@ func (self *containerdFactory) CanHandleAndAccept(name string) (bool, bool, erro
 	// If container and task lookup in containerd fails then we assume
 	// that the container state is not known to containerd
 	ctx := context.Background()
-	_, err := self.client.LoadContainer(ctx, id)
+	_, err := f.client.LoadContainer(ctx, id)
 	if err != nil {
 		return false, false, fmt.Errorf("failed to load container: %v", err)
 	}
@@ -112,13 +113,13 @@ func (self *containerdFactory) CanHandleAndAccept(name string) (bool, bool, erro
 	return true, true, nil
 }
 
-func (self *containerdFactory) DebugInfo() map[string][]string {
+func (f *containerdFactory) DebugInfo() map[string][]string {
 	return map[string][]string{}
 }
 
 // Register root container before running this function!
-func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, ignoreMetrics container.MetricSet) error {
-	client, err := Client()
+func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, includedMetrics container.MetricSet) error {
+	client, err := Client(*ArgContainerdEndpoint, *ArgContainerdNamespace)
 	if err != nil {
 		return fmt.Errorf("unable to create containerd client: %v", err)
 	}
@@ -128,19 +129,19 @@ func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, ignoreMetrics c
 		return fmt.Errorf("failed to fetch containerd client version: %v", err)
 	}
 
-	cgroupSubsystems, err := libcontainer.GetCgroupSubsystems()
+	cgroupSubsystems, err := libcontainer.GetCgroupSubsystems(includedMetrics)
 	if err != nil {
 		return fmt.Errorf("failed to get cgroup subsystems: %v", err)
 	}
 
-	glog.V(1).Infof("Registering containerd factory")
+	klog.V(1).Infof("Registering containerd factory")
 	f := &containerdFactory{
 		cgroupSubsystems:   cgroupSubsystems,
 		client:             client,
 		fsInfo:             fsInfo,
 		machineInfoFactory: factory,
 		version:            containerdVersion,
-		ignoreMetrics:      ignoreMetrics,
+		includedMetrics:    includedMetrics,
 	}
 
 	container.RegisterContainerHandlerFactory(f, []watcher.ContainerWatchSource{watcher.Raw})

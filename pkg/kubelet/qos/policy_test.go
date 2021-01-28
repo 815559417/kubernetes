@@ -20,8 +20,9 @@ import (
 	"strconv"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/kubernetes/pkg/apis/scheduling"
 )
 
 const (
@@ -135,6 +136,19 @@ var (
 			},
 		},
 	}
+
+	systemCritical = scheduling.SystemCriticalPriority
+
+	critical = v1.Pod{
+		Spec: v1.PodSpec{
+			Priority: &systemCritical,
+			Containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{},
+				},
+			},
+		},
+	}
 )
 
 type oomTest struct {
@@ -173,8 +187,8 @@ func TestGetContainerOOMScoreAdjust(t *testing.T) {
 		{
 			pod:             &equalRequestLimitCPUMemory,
 			memoryCapacity:  123456789,
-			lowOOMScoreAdj:  -998,
-			highOOMScoreAdj: -998,
+			lowOOMScoreAdj:  -997,
+			highOOMScoreAdj: -997,
 		},
 		{
 			pod:             &cpuUnlimitedMemoryLimitedWithRequests,
@@ -185,8 +199,14 @@ func TestGetContainerOOMScoreAdjust(t *testing.T) {
 		{
 			pod:             &requestNoLimit,
 			memoryCapacity:  standardMemoryAmount,
-			lowOOMScoreAdj:  2,
-			highOOMScoreAdj: 2,
+			lowOOMScoreAdj:  3,
+			highOOMScoreAdj: 3,
+		},
+		{
+			pod:             &critical,
+			memoryCapacity:  4000000000,
+			lowOOMScoreAdj:  -997,
+			highOOMScoreAdj: -997,
 		},
 	}
 	for _, test := range oomTests {

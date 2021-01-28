@@ -26,6 +26,7 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,7 +34,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
+	"k8s.io/apimachinery/pkg/util/wait"
 	auditinternal "k8s.io/apiserver/pkg/apis/audit"
+	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
 	auditv1beta1 "k8s.io/apiserver/pkg/apis/audit/v1beta1"
 	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/client-go/tools/clientcmd/api/v1"
@@ -105,24 +108,33 @@ func newWebhook(t *testing.T, endpoint string, groupVersion schema.GroupVersion)
 	// NOTE(ericchiang): Do we need to use a proper serializer?
 	require.NoError(t, stdjson.NewEncoder(f).Encode(config), "writing kubeconfig")
 
-	b, err := NewBackend(f.Name(), groupVersion, DefaultInitialBackoff)
+	retryBackoff := wait.Backoff{
+		Duration: 500 * time.Millisecond,
+		Factor:   1.5,
+		Jitter:   0.2,
+		Steps:    5,
+	}
+	b, err := NewBackend(f.Name(), groupVersion, retryBackoff, nil)
 	require.NoError(t, err, "initializing backend")
 
 	return b.(*backend)
 }
 
 func TestWebhook(t *testing.T) {
-	gotEvents := false
-	defer func() { require.True(t, gotEvents, "no events received") }()
+	versions := []schema.GroupVersion{auditv1.SchemeGroupVersion, auditv1beta1.SchemeGroupVersion}
+	for _, version := range versions {
+		gotEvents := false
 
-	s := httptest.NewServer(newWebhookHandler(t, &auditv1beta1.EventList{}, func(events runtime.Object) {
-		gotEvents = true
-	}))
-	defer s.Close()
+		s := httptest.NewServer(newWebhookHandler(t, &auditv1.EventList{}, func(events runtime.Object) {
+			gotEvents = true
+		}))
+		defer s.Close()
 
-	backend := newWebhook(t, s.URL, auditv1beta1.SchemeGroupVersion)
+		backend := newWebhook(t, s.URL, auditv1.SchemeGroupVersion)
 
-	// Ensure this doesn't return a serialization error.
-	event := &auditinternal.Event{}
-	require.NoError(t, backend.processEvents(event), "failed to send events")
+		// Ensure this doesn't return a serialization error.
+		event := &auditinternal.Event{}
+		require.NoError(t, backend.processEvents(event), fmt.Sprintf("failed to send events, apiVersion: %s", version))
+		require.True(t, gotEvents, fmt.Sprintf("no events received, apiVersion: %s", version))
+	}
 }

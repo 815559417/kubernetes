@@ -189,8 +189,8 @@ func TestInvalidPodFiltered(t *testing.T) {
 	channel <- podUpdate
 	expectPodUpdate(t, ch, CreatePodUpdate(kubetypes.ADD, TestSource, CreateValidPod("foo", "new")))
 
-	// add an invalid update
-	podUpdate = CreatePodUpdate(kubetypes.UPDATE, TestSource, &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}})
+	// add an invalid update, pod with the same name
+	podUpdate = CreatePodUpdate(kubetypes.ADD, TestSource, CreateValidPod("foo", "new"))
 	channel <- podUpdate
 	expectNoPodUpdate(t, ch)
 }
@@ -369,7 +369,7 @@ func TestPodUpdateAnnotations(t *testing.T) {
 	channel, ch, _ := createPodConfigTester(PodConfigNotificationIncremental)
 
 	pod := CreateValidPod("foo2", "new")
-	pod.Annotations = make(map[string]string, 0)
+	pod.Annotations = make(map[string]string)
 	pod.Annotations["kubernetes.io/blah"] = "blah"
 
 	clone := pod.DeepCopy()
@@ -398,7 +398,7 @@ func TestPodUpdateLabels(t *testing.T) {
 	channel, ch, _ := createPodConfigTester(PodConfigNotificationIncremental)
 
 	pod := CreateValidPod("foo2", "new")
-	pod.Labels = make(map[string]string, 0)
+	pod.Labels = make(map[string]string)
 	pod.Labels["key"] = "value"
 
 	clone := pod.DeepCopy()

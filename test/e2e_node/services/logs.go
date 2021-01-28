@@ -44,12 +44,6 @@ func (l *logFiles) String() string {
 
 // Set function of flag.Value
 func (l *logFiles) Set(value string) error {
-	// Someone else is calling flag.Parse after the flags are parsed in the
-	// test framework. Use this to avoid the flag being parsed twice.
-	// TODO(random-liu): Figure out who is parsing the flags.
-	if flag.Parsed() {
-		return nil
-	}
 	var log LogFileData
 	if err := json.Unmarshal([]byte(value), &log); err != nil {
 		return err
@@ -84,6 +78,11 @@ var requiredLogs = []LogFileData{
 		Name:              "docker.log",
 		Files:             []string{"/var/log/docker.log", "/var/log/upstart/docker.log"},
 		JournalctlCommand: []string{"-u", "docker"},
+	},
+	{
+		Name:              "containerd.log",
+		Files:             []string{"/var/log/containerd.log"},
+		JournalctlCommand: []string{"-u", "containerd"},
 	},
 }
 

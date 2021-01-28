@@ -17,22 +17,29 @@ limitations under the License.
 package kubelet
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"path/filepath"
+	"time"
 
-	"github.com/golang/glog"
 	cadvisorapiv1 "github.com/google/cadvisor/info/v1"
+	cadvisorv2 "github.com/google/cadvisor/info/v2"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
+	utilpath "k8s.io/utils/path"
+	utilstrings "k8s.io/utils/strings"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	utilfile "k8s.io/kubernetes/pkg/util/file"
+	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
 	utilnode "k8s.io/kubernetes/pkg/util/node"
-	volumeutil "k8s.io/kubernetes/pkg/volume/util"
+	"k8s.io/kubernetes/pkg/volume/csi"
 )
 
 // getRootDir returns the full path to the directory under which kubelet can
@@ -55,6 +62,14 @@ func (kl *Kubelet) getPodsDir() string {
 // after their own names.
 func (kl *Kubelet) getPluginsDir() string {
 	return filepath.Join(kl.getRootDir(), config.DefaultKubeletPluginsDirName)
+}
+
+// getPluginsRegistrationDir returns the full path to the directory under which
+// plugins socket should be placed to be registered.
+// More information is available about plugin registration in the pluginwatcher
+// module
+func (kl *Kubelet) getPluginsRegistrationDir() string {
+	return filepath.Join(kl.getRootDir(), config.DefaultKubeletPluginsRegistrationDirName)
 }
 
 // getPluginDir returns a data directory name for a given plugin name.
@@ -89,6 +104,13 @@ func (kl *Kubelet) GetPodDir(podUID types.UID) string {
 // the given UID.
 func (kl *Kubelet) getPodDir(podUID types.UID) string {
 	return filepath.Join(kl.getPodsDir(), string(podUID))
+}
+
+// getPodVolumesSubpathsDir returns the full path to the per-pod subpaths directory under
+// which subpath volumes are created for the specified pod.  This directory may not
+// exist if the pod does not exist or subpaths are not specified.
+func (kl *Kubelet) getPodVolumeSubpathsDir(podUID types.UID) string {
+	return filepath.Join(kl.getPodDir(podUID), config.DefaultKubeletVolumeSubpathsDirName)
 }
 
 // getPodVolumesDir returns the full path to the per-pod data directory under
@@ -139,10 +161,26 @@ func (kl *Kubelet) getPodContainerDir(podUID types.UID, ctrName string) string {
 	return filepath.Join(kl.getPodDir(podUID), config.DefaultKubeletContainersDirName, ctrName)
 }
 
+// getPodResourcesSocket returns the full path to the directory containing the pod resources socket
+func (kl *Kubelet) getPodResourcesDir() string {
+	return filepath.Join(kl.getRootDir(), config.DefaultKubeletPodResourcesDirName)
+}
+
 // GetPods returns all pods bound to the kubelet and their spec, and the mirror
 // pods.
 func (kl *Kubelet) GetPods() []*v1.Pod {
-	return kl.podManager.GetPods()
+	pods := kl.podManager.GetPods()
+	// a kubelet running without apiserver requires an additional
+	// update of the static pod status. See #57106
+	for _, p := range pods {
+		if kubelettypes.IsStaticPod(p) {
+			if status, ok := kl.statusManager.GetPodStatus(p.UID); ok {
+				klog.V(2).InfoS("Pod status updated", "pod", klog.KObj(p), "status", status.Phase)
+				p.Status = status
+			}
+		}
+	}
+	return pods
 }
 
 // GetRunningPods returns all pods running on kubelet from looking at the
@@ -174,6 +212,16 @@ func (kl *Kubelet) GetPodByName(namespace, name string) (*v1.Pod, bool) {
 	return kl.podManager.GetPodByName(namespace, name)
 }
 
+// GetPodByCgroupfs provides the pod that maps to the specified cgroup, as well
+// as whether the pod was found.
+func (kl *Kubelet) GetPodByCgroupfs(cgroupfs string) (*v1.Pod, bool) {
+	pcm := kl.containerManager.NewPodContainerManager()
+	if result, podUID := pcm.IsPodCgroup(cgroupfs); result {
+		return kl.podManager.GetPodByUID(podUID)
+	}
+	return nil, false
+}
+
 // GetHostname Returns the hostname as the kubelet sees it.
 func (kl *Kubelet) GetHostname() string {
 	return kl.hostname
@@ -187,9 +235,18 @@ func (kl *Kubelet) getRuntime() kubecontainer.Runtime {
 // GetNode returns the node info for the configured node name of this Kubelet.
 func (kl *Kubelet) GetNode() (*v1.Node, error) {
 	if kl.kubeClient == nil {
-		return kl.initialNode()
+		return kl.initialNode(context.TODO())
 	}
-	return kl.nodeInfo.GetNodeInfo(string(kl.nodeName))
+	// if we have a valid kube client, we wait for initial lister to sync
+	if !kl.nodeHasSynced() {
+		err := wait.PollImmediate(time.Second, maxWaitForAPIServerSync, func() (bool, error) {
+			return kl.nodeHasSynced(), nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("nodes have not yet been read at least once, cannot construct node object")
+		}
+	}
+	return kl.nodeLister.Get(string(kl.nodeName))
 }
 
 // getNodeAnyWay() must return a *v1.Node which is required by RunGeneralPredicates().
@@ -199,11 +256,11 @@ func (kl *Kubelet) GetNode() (*v1.Node, error) {
 // zero capacity, and the default labels.
 func (kl *Kubelet) getNodeAnyWay() (*v1.Node, error) {
 	if kl.kubeClient != nil {
-		if n, err := kl.nodeInfo.GetNodeInfo(string(kl.nodeName)); err == nil {
+		if n, err := kl.GetNode(); err == nil {
 			return n, nil
 		}
 	}
-	return kl.initialNode()
+	return kl.initialNode(context.TODO())
 }
 
 // GetNodeConfig returns the container manager node config.
@@ -216,23 +273,23 @@ func (kl *Kubelet) GetPodCgroupRoot() string {
 	return kl.containerManager.GetPodCgroupRoot()
 }
 
-// GetHostIP returns host IP or nil in case of error.
-func (kl *Kubelet) GetHostIP() (net.IP, error) {
+// GetHostIPs returns host IPs or nil in case of error.
+func (kl *Kubelet) GetHostIPs() ([]net.IP, error) {
 	node, err := kl.GetNode()
 	if err != nil {
 		return nil, fmt.Errorf("cannot get node: %v", err)
 	}
-	return utilnode.GetNodeHostIP(node)
+	return utilnode.GetNodeHostIPs(node)
 }
 
-// getHostIPAnyway attempts to return the host IP from kubelet's nodeInfo, or
+// getHostIPsAnyWay attempts to return the host IPs from kubelet's nodeInfo, or
 // the initialNode.
-func (kl *Kubelet) getHostIPAnyWay() (net.IP, error) {
+func (kl *Kubelet) getHostIPsAnyWay() ([]net.IP, error) {
 	node, err := kl.getNodeAnyWay()
 	if err != nil {
 		return nil, err
 	}
-	return utilnode.GetNodeHostIP(node)
+	return utilnode.GetNodeHostIPs(node)
 }
 
 // GetExtraSupplementalGroupsForPod returns a list of the extra
@@ -248,27 +305,41 @@ func (kl *Kubelet) getPodVolumePathListFromDisk(podUID types.UID) ([]string, err
 	volumes := []string{}
 	podVolDir := kl.getPodVolumesDir(podUID)
 
-	if pathExists, pathErr := volumeutil.PathExists(podVolDir); pathErr != nil {
-		return volumes, fmt.Errorf("Error checking if path %q exists: %v", podVolDir, pathErr)
+	if pathExists, pathErr := mount.PathExists(podVolDir); pathErr != nil {
+		return volumes, fmt.Errorf("error checking if path %q exists: %v", podVolDir, pathErr)
 	} else if !pathExists {
-		glog.Warningf("Path %q does not exist", podVolDir)
+		klog.Warningf("Path %q does not exist", podVolDir)
 		return volumes, nil
 	}
 
 	volumePluginDirs, err := ioutil.ReadDir(podVolDir)
 	if err != nil {
-		glog.Errorf("Could not read directory %s: %v", podVolDir, err)
+		klog.Errorf("Could not read directory %s: %v", podVolDir, err)
 		return volumes, err
 	}
 	for _, volumePluginDir := range volumePluginDirs {
 		volumePluginName := volumePluginDir.Name()
 		volumePluginPath := filepath.Join(podVolDir, volumePluginName)
-		volumeDirs, err := utilfile.ReadDirNoStat(volumePluginPath)
+		volumeDirs, err := utilpath.ReadDirNoStat(volumePluginPath)
 		if err != nil {
-			return volumes, fmt.Errorf("Could not read directory %s: %v", volumePluginPath, err)
+			return volumes, fmt.Errorf("could not read directory %s: %v", volumePluginPath, err)
 		}
-		for _, volumeDir := range volumeDirs {
-			volumes = append(volumes, filepath.Join(volumePluginPath, volumeDir))
+		unescapePluginName := utilstrings.UnescapeQualifiedName(volumePluginName)
+
+		if unescapePluginName != csi.CSIPluginName {
+			for _, volumeDir := range volumeDirs {
+				volumes = append(volumes, filepath.Join(volumePluginPath, volumeDir))
+			}
+		} else {
+			// For CSI volumes, the mounted volume path has an extra sub path "/mount", so also add it
+			// to the list if the mounted path exists.
+			for _, volumeDir := range volumeDirs {
+				path := filepath.Join(volumePluginPath, volumeDir)
+				csimountpath := csi.GetCSIMounterPath(path)
+				if pathExists, _ := mount.PathExists(csimountpath); pathExists {
+					volumes = append(volumes, csimountpath)
+				}
+			}
 		}
 	}
 	return volumes, nil
@@ -280,16 +351,39 @@ func (kl *Kubelet) getMountedVolumePathListFromDisk(podUID types.UID) ([]string,
 	if err != nil {
 		return mountedVolumes, err
 	}
+	// Only use IsLikelyNotMountPoint to check might not cover all cases. For CSI volumes that
+	// either: 1) don't mount or 2) bind mount in the rootfs, the mount check will not work as expected.
+	// We plan to remove this mountpoint check as a condition before deleting pods since it is
+	// not reliable and the condition might be different for different types of volumes. But it requires
+	// a reliable way to clean up unused volume dir to avoid problems during pod deletion. See discussion in issue #74650
 	for _, volumePath := range volumePaths {
 		isNotMount, err := kl.mounter.IsLikelyNotMountPoint(volumePath)
 		if err != nil {
-			return mountedVolumes, err
+			return mountedVolumes, fmt.Errorf("fail to check mount point %q: %v", volumePath, err)
 		}
 		if !isNotMount {
 			mountedVolumes = append(mountedVolumes, volumePath)
 		}
 	}
 	return mountedVolumes, nil
+}
+
+// podVolumesSubpathsDirExists returns true if the pod volume-subpaths directory for
+// a given pod exists
+func (kl *Kubelet) podVolumeSubpathsDirExists(podUID types.UID) (bool, error) {
+	podVolDir := kl.getPodVolumeSubpathsDir(podUID)
+
+	if pathExists, pathErr := mount.PathExists(podVolDir); pathErr != nil {
+		return true, fmt.Errorf("error checking if path %q exists: %v", podVolDir, pathErr)
+	} else if !pathExists {
+		return false, nil
+	}
+	return true, nil
+}
+
+// GetRequestedContainersInfo returns container info.
+func (kl *Kubelet) GetRequestedContainersInfo(containerName string, options cadvisorv2.RequestOptions) (map[string]*cadvisorapiv1.ContainerInfo, error) {
+	return kl.cadvisor.GetRequestedContainersInfo(containerName, options)
 }
 
 // GetVersionInfo returns information about the version of cAdvisor in use.
@@ -299,5 +393,13 @@ func (kl *Kubelet) GetVersionInfo() (*cadvisorapiv1.VersionInfo, error) {
 
 // GetCachedMachineInfo assumes that the machine info can't change without a reboot
 func (kl *Kubelet) GetCachedMachineInfo() (*cadvisorapiv1.MachineInfo, error) {
+	kl.machineInfoLock.RLock()
+	defer kl.machineInfoLock.RUnlock()
 	return kl.machineInfo, nil
+}
+
+func (kl *Kubelet) setCachedMachineInfo(info *cadvisorapiv1.MachineInfo) {
+	kl.machineInfoLock.Lock()
+	defer kl.machineInfoLock.Unlock()
+	kl.machineInfo = info
 }

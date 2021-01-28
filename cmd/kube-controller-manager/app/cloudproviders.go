@@ -19,10 +19,10 @@ package app
 import (
 	"fmt"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
 	"k8s.io/client-go/informers"
-	"k8s.io/kubernetes/pkg/cloudprovider"
+	cloudprovider "k8s.io/cloud-provider"
 )
 
 // createCloudProvider helps consolidate what is needed for cloud providers, we explicitly list the things
@@ -41,6 +41,8 @@ func createCloudProvider(cloudProvider string, externalCloudVolumePlugin string,
 		}
 		cloud, err = cloudprovider.InitCloudProvider(externalCloudVolumePlugin, cloudConfigFile)
 	} else {
+		cloudprovider.DeprecationWarningForProvider(cloudProvider)
+
 		loopMode = IncludeCloudLoops
 		cloud, err = cloudprovider.InitCloudProvider(cloudProvider, cloudConfigFile)
 	}
@@ -48,9 +50,9 @@ func createCloudProvider(cloudProvider string, externalCloudVolumePlugin string,
 		return nil, loopMode, fmt.Errorf("cloud provider could not be initialized: %v", err)
 	}
 
-	if cloud != nil && cloud.HasClusterID() == false {
-		if allowUntaggedCloud == true {
-			glog.Warning("detected a cluster without a ClusterID.  A ClusterID will be required in the future.  Please tag your cluster to avoid any future issues")
+	if cloud != nil && !cloud.HasClusterID() {
+		if allowUntaggedCloud {
+			klog.Warning("detected a cluster without a ClusterID.  A ClusterID will be required in the future.  Please tag your cluster to avoid any future issues")
 		} else {
 			return nil, loopMode, fmt.Errorf("no ClusterID Found.  A ClusterID is required for the cloud provider to function properly.  This check can be bypassed by setting the allow-untagged-cloud option")
 		}

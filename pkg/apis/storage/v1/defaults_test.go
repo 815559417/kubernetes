@@ -20,11 +20,14 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	_ "k8s.io/kubernetes/pkg/apis/storage/install"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
@@ -48,37 +51,88 @@ func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
 	return obj3
 }
 
+func TestSetDefaultStorageCapacityEnabled(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIStorageCapacity, true)()
+	driver := &storagev1.CSIDriver{}
+
+	// field should be defaulted
+	defaultStorageCapacity := false
+	output := roundTrip(t, runtime.Object(driver)).(*storagev1.CSIDriver)
+	outStorageCapacity := output.Spec.StorageCapacity
+	if outStorageCapacity == nil {
+		t.Errorf("Expected StorageCapacity to be defaulted to: %+v, got: nil", defaultStorageCapacity)
+	} else if *outStorageCapacity != defaultStorageCapacity {
+		t.Errorf("Expected StorageCapacity to be defaulted to: %+v, got: %+v", defaultStorageCapacity, outStorageCapacity)
+	}
+}
+
+func TestSetDefaultStorageCapacityDisabled(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIStorageCapacity, false)()
+	driver := &storagev1.CSIDriver{}
+
+	// field should not be defaulted
+	output := roundTrip(t, runtime.Object(driver)).(*storagev1.CSIDriver)
+	outStorageCapacity := output.Spec.StorageCapacity
+	if outStorageCapacity != nil {
+		t.Errorf("Expected StorageCapacity to remain nil, got: %+v", outStorageCapacity)
+	}
+}
+
 func TestSetDefaultVolumeBindingMode(t *testing.T) {
 	class := &storagev1.StorageClass{}
 
-	// When feature gate is disabled, field should not be defaulted
-	err := utilfeature.DefaultFeatureGate.Set("VolumeScheduling=false")
-	if err != nil {
-		t.Fatalf("Failed to enable feature gate for VolumeScheduling: %v", err)
-	}
-	output := roundTrip(t, runtime.Object(class)).(*storagev1.StorageClass)
-	if output.VolumeBindingMode != nil {
-		t.Errorf("Expected VolumeBindingMode to not be defaulted, got: %+v", output.VolumeBindingMode)
-	}
-
-	class = &storagev1.StorageClass{}
-
-	// When feature gate is enabled, field should be defaulted
-	err = utilfeature.DefaultFeatureGate.Set("VolumeScheduling=true")
-	if err != nil {
-		t.Fatalf("Failed to enable feature gate for VolumeScheduling: %v", err)
-	}
+	// field should be defaulted
 	defaultMode := storagev1.VolumeBindingImmediate
-	output = roundTrip(t, runtime.Object(class)).(*storagev1.StorageClass)
+	output := roundTrip(t, runtime.Object(class)).(*storagev1.StorageClass)
 	outMode := output.VolumeBindingMode
 	if outMode == nil {
 		t.Errorf("Expected VolumeBindingMode to be defaulted to: %+v, got: nil", defaultMode)
 	} else if *outMode != defaultMode {
 		t.Errorf("Expected VolumeBindingMode to be defaulted to: %+v, got: %+v", defaultMode, outMode)
 	}
+}
 
-	err = utilfeature.DefaultFeatureGate.Set("VolumeScheduling=false")
-	if err != nil {
-		t.Fatalf("Failed to disable feature gate for VolumeScheduling: %v", err)
+func TestSetDefaultCSIDriver(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIInlineVolume, true)()
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIServiceAccountToken, true)()
+
+	enabled := true
+	disabled := false
+	tests := []struct {
+		desc     string
+		field    string
+		wantSpec *storagev1.CSIDriverSpec
+	}{
+		{
+			desc:     "AttachRequired default to true",
+			field:    "AttachRequired",
+			wantSpec: &storagev1.CSIDriverSpec{AttachRequired: &enabled},
+		},
+		{
+			desc:     "PodInfoOnMount default to false",
+			field:    "PodInfoOnMount",
+			wantSpec: &storagev1.CSIDriverSpec{PodInfoOnMount: &disabled},
+		},
+		{
+			desc:     "VolumeLifecycleModes default to VolumeLifecyclePersistent",
+			field:    "VolumeLifecycleModes",
+			wantSpec: &storagev1.CSIDriverSpec{VolumeLifecycleModes: []storagev1.VolumeLifecycleMode{storagev1.VolumeLifecyclePersistent}},
+		},
+		{
+			desc:     "RequiresRepublish default to false",
+			field:    "RequiresRepublish",
+			wantSpec: &storagev1.CSIDriverSpec{RequiresRepublish: &disabled},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			gotSpec := roundTrip(t, runtime.Object(&storagev1.CSIDriver{})).(*storagev1.CSIDriver).Spec
+			got := reflect.Indirect(reflect.ValueOf(gotSpec)).FieldByName(test.field).Interface()
+			want := reflect.Indirect(reflect.ValueOf(test.wantSpec)).FieldByName(test.field).Interface()
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("CSIDriver defaults diff (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

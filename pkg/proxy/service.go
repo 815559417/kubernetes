@@ -23,16 +23,15 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
-	apiservice "k8s.io/kubernetes/pkg/api/service"
-	api "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/apis/core/helper"
+	apiservice "k8s.io/kubernetes/pkg/api/v1/service"
+	"k8s.io/kubernetes/pkg/proxy/metrics"
 	utilproxy "k8s.io/kubernetes/pkg/proxy/util"
-	utilnet "k8s.io/kubernetes/pkg/util/net"
 )
 
 // BaseServiceInfo contains base information that defines a service.
@@ -40,96 +39,174 @@ import (
 // or can be used for constructing a more specific ServiceInfo struct
 // defined by the proxier if needed.
 type BaseServiceInfo struct {
-	ClusterIP                net.IP
-	Port                     int
-	Protocol                 api.Protocol
-	NodePort                 int
-	LoadBalancerStatus       api.LoadBalancerStatus
-	SessionAffinityType      api.ServiceAffinity
-	StickyMaxAgeSeconds      int
-	ExternalIPs              []string
-	LoadBalancerSourceRanges []string
-	HealthCheckNodePort      int
-	OnlyNodeLocalEndpoints   bool
+	clusterIP                net.IP
+	port                     int
+	protocol                 v1.Protocol
+	nodePort                 int
+	loadBalancerStatus       v1.LoadBalancerStatus
+	sessionAffinityType      v1.ServiceAffinity
+	stickyMaxAgeSeconds      int
+	externalIPs              []string
+	loadBalancerSourceRanges []string
+	healthCheckNodePort      int
+	onlyNodeLocalEndpoints   bool
+	topologyKeys             []string
 }
 
 var _ ServicePort = &BaseServiceInfo{}
 
 // String is part of ServicePort interface.
 func (info *BaseServiceInfo) String() string {
-	return fmt.Sprintf("%s:%d/%s", info.ClusterIP, info.Port, info.Protocol)
+	return fmt.Sprintf("%s:%d/%s", info.clusterIP, info.port, info.protocol)
 }
 
-// ClusterIPString is part of ServicePort interface.
-func (info *BaseServiceInfo) ClusterIPString() string {
-	return info.ClusterIP.String()
+// ClusterIP is part of ServicePort interface.
+func (info *BaseServiceInfo) ClusterIP() net.IP {
+	return info.clusterIP
 }
 
-// GetProtocol is part of ServicePort interface.
-func (info *BaseServiceInfo) GetProtocol() api.Protocol {
-	return info.Protocol
+// Port is part of ServicePort interface.
+func (info *BaseServiceInfo) Port() int {
+	return info.port
 }
 
-// GetHealthCheckNodePort is part of ServicePort interface.
-func (info *BaseServiceInfo) GetHealthCheckNodePort() int {
-	return info.HealthCheckNodePort
+// SessionAffinityType is part of the ServicePort interface.
+func (info *BaseServiceInfo) SessionAffinityType() v1.ServiceAffinity {
+	return info.sessionAffinityType
 }
 
-func (sct *ServiceChangeTracker) newBaseServiceInfo(port *api.ServicePort, service *api.Service) *BaseServiceInfo {
+// StickyMaxAgeSeconds is part of the ServicePort interface
+func (info *BaseServiceInfo) StickyMaxAgeSeconds() int {
+	return info.stickyMaxAgeSeconds
+}
+
+// Protocol is part of ServicePort interface.
+func (info *BaseServiceInfo) Protocol() v1.Protocol {
+	return info.protocol
+}
+
+// LoadBalancerSourceRanges is part of ServicePort interface
+func (info *BaseServiceInfo) LoadBalancerSourceRanges() []string {
+	return info.loadBalancerSourceRanges
+}
+
+// HealthCheckNodePort is part of ServicePort interface.
+func (info *BaseServiceInfo) HealthCheckNodePort() int {
+	return info.healthCheckNodePort
+}
+
+// NodePort is part of the ServicePort interface.
+func (info *BaseServiceInfo) NodePort() int {
+	return info.nodePort
+}
+
+// ExternalIPStrings is part of ServicePort interface.
+func (info *BaseServiceInfo) ExternalIPStrings() []string {
+	return info.externalIPs
+}
+
+// LoadBalancerIPStrings is part of ServicePort interface.
+func (info *BaseServiceInfo) LoadBalancerIPStrings() []string {
+	var ips []string
+	for _, ing := range info.loadBalancerStatus.Ingress {
+		ips = append(ips, ing.IP)
+	}
+	return ips
+}
+
+// OnlyNodeLocalEndpoints is part of ServicePort interface.
+func (info *BaseServiceInfo) OnlyNodeLocalEndpoints() bool {
+	return info.onlyNodeLocalEndpoints
+}
+
+// TopologyKeys is part of ServicePort interface.
+func (info *BaseServiceInfo) TopologyKeys() []string {
+	return info.topologyKeys
+}
+
+func (sct *ServiceChangeTracker) newBaseServiceInfo(port *v1.ServicePort, service *v1.Service) *BaseServiceInfo {
 	onlyNodeLocalEndpoints := false
 	if apiservice.RequestsOnlyLocalTraffic(service) {
 		onlyNodeLocalEndpoints = true
 	}
 	var stickyMaxAgeSeconds int
-	if service.Spec.SessionAffinity == api.ServiceAffinityClientIP {
+	if service.Spec.SessionAffinity == v1.ServiceAffinityClientIP {
 		// Kube-apiserver side guarantees SessionAffinityConfig won't be nil when session affinity type is ClientIP
 		stickyMaxAgeSeconds = int(*service.Spec.SessionAffinityConfig.ClientIP.TimeoutSeconds)
 	}
+
+	clusterIP := utilproxy.GetClusterIPByFamily(sct.ipFamily, service)
 	info := &BaseServiceInfo{
-		ClusterIP: net.ParseIP(service.Spec.ClusterIP),
-		Port:      int(port.Port),
-		Protocol:  port.Protocol,
-		NodePort:  int(port.NodePort),
-		// Deep-copy in case the service instance changes
-		LoadBalancerStatus:     *helper.LoadBalancerStatusDeepCopy(&service.Status.LoadBalancer),
-		SessionAffinityType:    service.Spec.SessionAffinity,
-		StickyMaxAgeSeconds:    stickyMaxAgeSeconds,
-		OnlyNodeLocalEndpoints: onlyNodeLocalEndpoints,
+		clusterIP:              net.ParseIP(clusterIP),
+		port:                   int(port.Port),
+		protocol:               port.Protocol,
+		nodePort:               int(port.NodePort),
+		sessionAffinityType:    service.Spec.SessionAffinity,
+		stickyMaxAgeSeconds:    stickyMaxAgeSeconds,
+		onlyNodeLocalEndpoints: onlyNodeLocalEndpoints,
+		topologyKeys:           service.Spec.TopologyKeys,
 	}
 
-	if sct.isIPv6Mode == nil {
-		info.ExternalIPs = make([]string, len(service.Spec.ExternalIPs))
-		info.LoadBalancerSourceRanges = make([]string, len(service.Spec.LoadBalancerSourceRanges))
-		copy(info.LoadBalancerSourceRanges, service.Spec.LoadBalancerSourceRanges)
-		copy(info.ExternalIPs, service.Spec.ExternalIPs)
-	} else {
-		// Filter out the incorrect IP version case.
-		// If ExternalIPs and LoadBalancerSourceRanges on service contains incorrect IP versions,
-		// only filter out the incorrect ones.
-		var incorrectIPs []string
-		info.ExternalIPs, incorrectIPs = utilnet.FilterIncorrectIPVersion(service.Spec.ExternalIPs, *sct.isIPv6Mode)
-		if len(incorrectIPs) > 0 {
-			utilproxy.LogAndEmitIncorrectIPVersionEvent(sct.recorder, "externalIPs", strings.Join(incorrectIPs, ","), service.Namespace, service.Name, service.UID)
+	loadBalancerSourceRanges := make([]string, len(service.Spec.LoadBalancerSourceRanges))
+	for i, sourceRange := range service.Spec.LoadBalancerSourceRanges {
+		loadBalancerSourceRanges[i] = strings.TrimSpace(sourceRange)
+	}
+	// filter external ips, source ranges and ingress ips
+	// prior to dual stack services, this was considered an error, but with dual stack
+	// services, this is actually expected. Hence we downgraded from reporting by events
+	// to just log lines with high verbosity
+
+	ipFamilyMap := utilproxy.MapIPsByIPFamily(service.Spec.ExternalIPs)
+	info.externalIPs = ipFamilyMap[sct.ipFamily]
+
+	// Log the IPs not matching the ipFamily
+	if ips, ok := ipFamilyMap[utilproxy.OtherIPFamily(sct.ipFamily)]; ok && len(ips) > 0 {
+		klog.V(4).Infof("service change tracker(%v) ignored the following external IPs(%s) for service %v/%v as they don't match IPFamily", sct.ipFamily, strings.Join(ips, ","), service.Namespace, service.Name)
+	}
+
+	ipFamilyMap = utilproxy.MapCIDRsByIPFamily(loadBalancerSourceRanges)
+	info.loadBalancerSourceRanges = ipFamilyMap[sct.ipFamily]
+	// Log the CIDRs not matching the ipFamily
+	if cidrs, ok := ipFamilyMap[utilproxy.OtherIPFamily(sct.ipFamily)]; ok && len(cidrs) > 0 {
+		klog.V(4).Infof("service change tracker(%v) ignored the following load balancer source ranges(%s) for service %v/%v as they don't match IPFamily", sct.ipFamily, strings.Join(cidrs, ","), service.Namespace, service.Name)
+	}
+
+	// Obtain Load Balancer Ingress IPs
+	var ips []string
+	for _, ing := range service.Status.LoadBalancer.Ingress {
+		ips = append(ips, ing.IP)
+	}
+
+	if len(ips) > 0 {
+		ipFamilyMap = utilproxy.MapIPsByIPFamily(ips)
+
+		if ipList, ok := ipFamilyMap[utilproxy.OtherIPFamily(sct.ipFamily)]; ok && len(ipList) > 0 {
+			klog.V(4).Infof("service change tracker(%v) ignored the following load balancer(%s) ingress ips for service %v/%v as they don't match IPFamily", sct.ipFamily, strings.Join(ipList, ","), service.Namespace, service.Name)
+
 		}
-		info.LoadBalancerSourceRanges, incorrectIPs = utilnet.FilterIncorrectCIDRVersion(service.Spec.LoadBalancerSourceRanges, *sct.isIPv6Mode)
-		if len(incorrectIPs) > 0 {
-			utilproxy.LogAndEmitIncorrectIPVersionEvent(sct.recorder, "loadBalancerSourceRanges", strings.Join(incorrectIPs, ","), service.Namespace, service.Name, service.UID)
+		// Create the LoadBalancerStatus with the filtered IPs
+		for _, ip := range ipFamilyMap[sct.ipFamily] {
+			info.loadBalancerStatus.Ingress = append(info.loadBalancerStatus.Ingress, v1.LoadBalancerIngress{IP: ip})
 		}
 	}
 
 	if apiservice.NeedsHealthCheck(service) {
 		p := service.Spec.HealthCheckNodePort
 		if p == 0 {
-			glog.Errorf("Service %s/%s has no healthcheck nodeport", service.Namespace, service.Name)
+			klog.Errorf("Service %s/%s has no healthcheck nodeport", service.Namespace, service.Name)
 		} else {
-			info.HealthCheckNodePort = int(p)
+			info.healthCheckNodePort = int(p)
 		}
 	}
 
 	return info
 }
 
-type makeServicePortFunc func(*api.ServicePort, *api.Service, *BaseServiceInfo) ServicePort
+type makeServicePortFunc func(*v1.ServicePort, *v1.Service, *BaseServiceInfo) ServicePort
+
+// This handler is invoked by the apply function on every change. This function should not modify the
+// ServiceMap's but just use the changes for any Proxier specific cleanup.
+type processServiceMapChangeFunc func(previous, current ServiceMap)
 
 // serviceChange contains all changes to services that happened since proxy rules were synced.  For a single object,
 // changes are accumulated, i.e. previous is state from before applying the changes,
@@ -147,19 +224,21 @@ type ServiceChangeTracker struct {
 	// items maps a service to its serviceChange.
 	items map[types.NamespacedName]*serviceChange
 	// makeServiceInfo allows proxier to inject customized information when processing service.
-	makeServiceInfo makeServicePortFunc
-	// isIPv6Mode indicates if change tracker is under IPv6/IPv4 mode. Nil means not applicable.
-	isIPv6Mode *bool
-	recorder   record.EventRecorder
+	makeServiceInfo         makeServicePortFunc
+	processServiceMapChange processServiceMapChangeFunc
+	ipFamily                v1.IPFamily
+
+	recorder record.EventRecorder
 }
 
 // NewServiceChangeTracker initializes a ServiceChangeTracker
-func NewServiceChangeTracker(makeServiceInfo makeServicePortFunc, isIPv6Mode *bool, recorder record.EventRecorder) *ServiceChangeTracker {
+func NewServiceChangeTracker(makeServiceInfo makeServicePortFunc, ipFamily v1.IPFamily, recorder record.EventRecorder, processServiceMapChange processServiceMapChangeFunc) *ServiceChangeTracker {
 	return &ServiceChangeTracker{
-		items:           make(map[types.NamespacedName]*serviceChange),
-		makeServiceInfo: makeServiceInfo,
-		isIPv6Mode:      isIPv6Mode,
-		recorder:        recorder,
+		items:                   make(map[types.NamespacedName]*serviceChange),
+		makeServiceInfo:         makeServiceInfo,
+		recorder:                recorder,
+		ipFamily:                ipFamily,
+		processServiceMapChange: processServiceMapChange,
 	}
 }
 
@@ -171,7 +250,7 @@ func NewServiceChangeTracker(makeServiceInfo makeServicePortFunc, isIPv6Mode *bo
 //   - pass <oldService, service> as the <previous, current> pair.
 // Delete item
 //   - pass <service, nil> as the <previous, current> pair.
-func (sct *ServiceChangeTracker) Update(previous, current *api.Service) bool {
+func (sct *ServiceChangeTracker) Update(previous, current *v1.Service) bool {
 	svc := current
 	if svc == nil {
 		svc = previous
@@ -180,6 +259,7 @@ func (sct *ServiceChangeTracker) Update(previous, current *api.Service) bool {
 	if svc == nil {
 		return false
 	}
+	metrics.ServiceChangesTotal.Inc()
 	namespacedName := types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
 
 	sct.lock.Lock()
@@ -195,7 +275,10 @@ func (sct *ServiceChangeTracker) Update(previous, current *api.Service) bool {
 	// if change.previous equal to change.current, it means no change
 	if reflect.DeepEqual(change.previous, change.current) {
 		delete(sct.items, namespacedName)
+	} else {
+		klog.V(2).Infof("Service %s updated: %d ports", namespacedName, len(change.current))
 	}
+	metrics.ServiceChangesPending.Set(float64(len(sct.items)))
 	return len(sct.items) > 0
 }
 
@@ -209,17 +292,17 @@ type UpdateServiceMapResult struct {
 	UDPStaleClusterIP sets.String
 }
 
-// UpdateServiceMap updates ServiceMap based on the given changes.
-func UpdateServiceMap(serviceMap ServiceMap, changes *ServiceChangeTracker) (result UpdateServiceMapResult) {
+// Update updates ServiceMap base on the given changes.
+func (sm ServiceMap) Update(changes *ServiceChangeTracker) (result UpdateServiceMapResult) {
 	result.UDPStaleClusterIP = sets.NewString()
-	serviceMap.apply(changes, result.UDPStaleClusterIP)
+	sm.apply(changes, result.UDPStaleClusterIP)
 
 	// TODO: If this will appear to be computationally expensive, consider
 	// computing this incrementally similarly to serviceMap.
 	result.HCServiceNodePorts = make(map[types.NamespacedName]uint16)
-	for svcPortName, info := range serviceMap {
-		if info.GetHealthCheckNodePort() != 0 {
-			result.HCServiceNodePorts[svcPortName.NamespacedName] = uint16(info.GetHealthCheckNodePort())
+	for svcPortName, info := range sm {
+		if info.HealthCheckNodePort() != 0 {
+			result.HCServiceNodePorts[svcPortName.NamespacedName] = uint16(info.HealthCheckNodePort())
 		}
 	}
 
@@ -232,28 +315,25 @@ type ServiceMap map[ServicePortName]ServicePort
 // serviceToServiceMap translates a single Service object to a ServiceMap.
 //
 // NOTE: service object should NOT be modified.
-func (sct *ServiceChangeTracker) serviceToServiceMap(service *api.Service) ServiceMap {
+func (sct *ServiceChangeTracker) serviceToServiceMap(service *v1.Service) ServiceMap {
 	if service == nil {
 		return nil
 	}
-	svcName := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
-	if utilproxy.ShouldSkipService(svcName, service) {
+
+	if utilproxy.ShouldSkipService(service) {
 		return nil
 	}
 
-	if len(service.Spec.ClusterIP) != 0 {
-		// Filter out the incorrect IP version case.
-		// If ClusterIP on service has incorrect IP version, service itself will be ignored.
-		if sct.isIPv6Mode != nil && utilnet.IsIPv6String(service.Spec.ClusterIP) != *sct.isIPv6Mode {
-			utilproxy.LogAndEmitIncorrectIPVersionEvent(sct.recorder, "clusterIP", service.Spec.ClusterIP, service.Namespace, service.Name, service.UID)
-			return nil
-		}
+	clusterIP := utilproxy.GetClusterIPByFamily(sct.ipFamily, service)
+	if clusterIP == "" {
+		return nil
 	}
 
 	serviceMap := make(ServiceMap)
+	svcName := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
 	for i := range service.Spec.Ports {
 		servicePort := &service.Spec.Ports[i]
-		svcPortName := ServicePortName{NamespacedName: svcName, Port: servicePort.Name}
+		svcPortName := ServicePortName{NamespacedName: svcName, Port: servicePort.Name, Protocol: servicePort.Protocol}
 		baseSvcInfo := sct.newBaseServiceInfo(servicePort, service)
 		if sct.makeServiceInfo != nil {
 			serviceMap[svcPortName] = sct.makeServiceInfo(servicePort, service, baseSvcInfo)
@@ -266,19 +346,23 @@ func (sct *ServiceChangeTracker) serviceToServiceMap(service *api.Service) Servi
 
 // apply the changes to ServiceMap and update the stale udp cluster IP set. The UDPStaleClusterIP argument is passed in to store the
 // udp protocol service cluster ip when service is deleted from the ServiceMap.
-func (serviceMap *ServiceMap) apply(changes *ServiceChangeTracker, UDPStaleClusterIP sets.String) {
+// apply triggers processServiceMapChange on every change.
+func (sm *ServiceMap) apply(changes *ServiceChangeTracker, UDPStaleClusterIP sets.String) {
 	changes.lock.Lock()
 	defer changes.lock.Unlock()
 	for _, change := range changes.items {
-		serviceMap.merge(change.current)
+		if changes.processServiceMapChange != nil {
+			changes.processServiceMapChange(change.previous, change.current)
+		}
+		sm.merge(change.current)
 		// filter out the Update event of current changes from previous changes before calling unmerge() so that can
 		// skip deleting the Update events.
 		change.previous.filter(change.current)
-		serviceMap.unmerge(change.previous, UDPStaleClusterIP)
+		sm.unmerge(change.previous, UDPStaleClusterIP)
 	}
 	// clear changes after applying them to ServiceMap.
 	changes.items = make(map[types.NamespacedName]*serviceChange)
-	return
+	metrics.ServiceChangesPending.Set(0)
 }
 
 // merge adds other ServiceMap's elements to current ServiceMap.
@@ -307,9 +391,9 @@ func (sm *ServiceMap) merge(other ServiceMap) sets.String {
 		existingPorts.Insert(svcPortName.String())
 		_, exists := (*sm)[svcPortName]
 		if !exists {
-			glog.V(1).Infof("Adding new service port %q at %s", svcPortName, info.String())
+			klog.V(1).Infof("Adding new service port %q at %s", svcPortName, info.String())
 		} else {
-			glog.V(1).Infof("Updating existing service port %q at %s", svcPortName, info.String())
+			klog.V(1).Infof("Updating existing service port %q at %s", svcPortName, info.String())
 		}
 		(*sm)[svcPortName] = info
 	}
@@ -332,13 +416,13 @@ func (sm *ServiceMap) unmerge(other ServiceMap, UDPStaleClusterIP sets.String) {
 	for svcPortName := range other {
 		info, exists := (*sm)[svcPortName]
 		if exists {
-			glog.V(1).Infof("Removing service port %q", svcPortName)
-			if info.GetProtocol() == api.ProtocolUDP {
-				UDPStaleClusterIP.Insert(info.ClusterIPString())
+			klog.V(1).Infof("Removing service port %q", svcPortName)
+			if info.Protocol() == v1.ProtocolUDP {
+				UDPStaleClusterIP.Insert(info.ClusterIP().String())
 			}
 			delete(*sm, svcPortName)
 		} else {
-			glog.Errorf("Service port %q doesn't exists", svcPortName)
+			klog.Errorf("Service port %q doesn't exists", svcPortName)
 		}
 	}
 }

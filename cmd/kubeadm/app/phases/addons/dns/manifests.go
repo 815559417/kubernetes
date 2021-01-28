@@ -17,20 +17,17 @@ limitations under the License.
 package dns
 
 const (
-	// v180AndAboveKubeDNSDeployment is the kube-dns Deployment manifest for the kube-dns manifest for v1.7+
-	v180AndAboveKubeDNSDeployment = `
+	// KubeDNSDeployment is the kube-dns Deployment manifest for the kube-dns manifest for v1.7+
+	KubeDNSDeployment = `
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: kube-dns
+  name: {{ .DeploymentName }}
   namespace: kube-system
   labels:
     k8s-app: kube-dns
 spec:
-  # replicas: not specified here:
-  # 1. In order to make Addon Manager do not reconcile this replicas parameter.
-  # 2. Default is 1.
-  # 3. Will be tuned in real time if DNS horizontal auto-scaling is turned on.
+  replicas: {{ .Replicas }}
   strategy:
     rollingUpdate:
       maxSurge: 10%
@@ -43,6 +40,7 @@ spec:
       labels:
         k8s-app: kube-dns
     spec:
+      priorityClassName: system-cluster-critical
       volumes:
       - name: kube-dns-config
         configMap:
@@ -50,7 +48,7 @@ spec:
           optional: true
       containers:
       - name: kubedns
-        image: {{ .ImageRepository }}/k8s-dns-kube-dns-{{ .Arch }}:{{ .Version }}
+        image: {{ .KubeDNSImage }}
         imagePullPolicy: IfNotPresent
         resources:
           # TODO: Set memory limits when we've profiled the container for large
@@ -76,7 +74,7 @@ spec:
             path: /readiness
             port: 8081
             scheme: HTTP
-          # we poll on pod startup for the Kubernetes master service and
+          # we poll on pod startup for the Kubernetes control-plane service and
           # only setup the /readiness HTTP server once that's available.
           initialDelaySeconds: 3
           timeoutSeconds: 5
@@ -102,7 +100,7 @@ spec:
         - name: kube-dns-config
           mountPath: /kube-dns-config
       - name: dnsmasq
-        image: {{ .ImageRepository }}/k8s-dns-dnsmasq-nanny-{{ .Arch }}:{{ .Version }}
+        image: {{ .DNSMasqImage }}
         imagePullPolicy: IfNotPresent
         livenessProbe:
           httpGet:
@@ -122,6 +120,7 @@ spec:
         - -k
         - --cache-size=1000
         - --no-negcache
+        - --dns-loop-detect
         - --log-facility=-
         - --server=/{{ .DNSDomain }}/{{ .DNSBindAddr }}#10053
         - --server=/in-addr.arpa/{{ .DNSBindAddr }}#10053
@@ -142,7 +141,7 @@ spec:
         - name: kube-dns-config
           mountPath: /etc/k8s/dns/dnsmasq-nanny
       - name: sidecar
-        image: {{ .ImageRepository }}/k8s-dns-sidecar-{{ .Arch }}:{{ .Version }}
+        image: {{ .SidecarImage }}
         imagePullPolicy: IfNotPresent
         livenessProbe:
           httpGet:
@@ -171,18 +170,10 @@ spec:
       tolerations:
       - key: CriticalAddonsOnly
         operator: Exists
-      - key: {{ .MasterTaintKey }}
+      - key: {{ .OldControlPlaneTaintKey }}
         effect: NoSchedule
-      # TODO: Remove this affinity field as soon as we are using manifest lists
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: beta.kubernetes.io/arch
-                operator: In
-                values:
-                - {{ .Arch }}
+      - key: {{ .ControlPlaneTaintKey }}
+        effect: NoSchedule
 `
 
 	// KubeDNSService is the kube-dns Service manifest
@@ -196,6 +187,9 @@ metadata:
     kubernetes.io/name: "KubeDNS"
   name: kube-dns
   namespace: kube-system
+  annotations:
+    prometheus.io/port: "9153"
+    prometheus.io/scrape: "true"
   # Without this resourceVersion value, an update of the Service between versions will yield:
   #   Service "kube-dns" is invalid: metadata.resourceVersion: Invalid value: "": must be specified for an update
   resourceVersion: "0"
@@ -210,6 +204,10 @@ spec:
     port: 53
     protocol: TCP
     targetPort: 53
+  - name: metrics
+    port: 9153
+    protocol: TCP
+    targetPort: 9153
   selector:
     k8s-app: kube-dns
 `
@@ -219,12 +217,12 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: coredns
+  name: {{ .DeploymentName }}
   namespace: kube-system
   labels:
     k8s-app: kube-dns
 spec:
-  replicas: 2
+  replicas: {{ .Replicas }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -237,15 +235,20 @@ spec:
       labels:
         k8s-app: kube-dns
     spec:
+      priorityClassName: system-cluster-critical
       serviceAccountName: coredns
       tolerations:
       - key: CriticalAddonsOnly
         operator: Exists
-      - key: {{ .MasterTaintKey }}
+      - key: {{ .OldControlPlaneTaintKey }}
         effect: NoSchedule
+      - key: {{ .ControlPlaneTaintKey }}
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/os: linux
       containers:
       - name: coredns
-        image: coredns/coredns:{{ .Version }}
+        image: {{ .Image }}
         imagePullPolicy: IfNotPresent
         resources:
           limits:
@@ -257,12 +260,16 @@ spec:
         volumeMounts:
         - name: config-volume
           mountPath: /etc/coredns
+          readOnly: true
         ports:
         - containerPort: 53
           name: dns
           protocol: UDP
         - containerPort: 53
           name: dns-tcp
+          protocol: TCP
+        - containerPort: 9153
+          name: metrics
           protocol: TCP
         livenessProbe:
           httpGet:
@@ -273,6 +280,19 @@ spec:
           timeoutSeconds: 5
           successThreshold: 1
           failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8181
+            scheme: HTTP
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - NET_BIND_SERVICE
+            drop:
+            - all
+          readOnlyRootFilesystem: true
       dnsPolicy: Default
       volumes:
         - name: config-volume
@@ -294,15 +314,23 @@ data:
   Corefile: |
     .:53 {
         errors
-        health
+        health {
+           lameduck 5s
+        }
+        ready
         kubernetes {{ .DNSDomain }} in-addr.arpa ip6.arpa {
            pods insecure
-           upstream
            fallthrough in-addr.arpa ip6.arpa
-        }{{ .Federation }}
+           ttl 30
+        }
         prometheus :9153
-        proxy . {{ .UpstreamNameserver }}
+        forward . {{ .UpstreamNameserver }} {
+           max_concurrent 1000
+        }
         cache 30
+        loop
+        reload
+        loadbalance
     }{{ .StubDomain }}
 `
 	// CoreDNSClusterRole is the CoreDNS ClusterRole manifest
@@ -322,6 +350,12 @@ rules:
   verbs:
   - list
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
 `
 	// CoreDNSClusterRoleBinding is the CoreDNS Clusterrolebinding manifest
 	CoreDNSClusterRoleBinding = `

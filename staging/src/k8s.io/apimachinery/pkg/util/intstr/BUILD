@@ -10,20 +10,22 @@ go_test(
     name = "go_default_test",
     srcs = ["intstr_test.go"],
     embed = [":go_default_library"],
-    deps = ["//vendor/github.com/ghodss/yaml:go_default_library"],
+    deps = ["//vendor/sigs.k8s.io/yaml:go_default_library"],
 )
 
 go_library(
     name = "go_default_library",
     srcs = [
         "generated.pb.go",
+        "instr_fuzz.go",
         "intstr.go",
     ],
+    importmap = "k8s.io/kubernetes/vendor/k8s.io/apimachinery/pkg/util/intstr",
     importpath = "k8s.io/apimachinery/pkg/util/intstr",
     deps = [
         "//vendor/github.com/gogo/protobuf/proto:go_default_library",
-        "//vendor/github.com/golang/glog:go_default_library",
         "//vendor/github.com/google/gofuzz:go_default_library",
+        "//vendor/k8s.io/klog/v2:go_default_library",
     ],
 )
 
@@ -38,10 +40,4 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
-)
-
-filegroup(
-    name = "go_default_library_protos",
-    srcs = ["generated.proto"],
-    visibility = ["//visibility:public"],
 )

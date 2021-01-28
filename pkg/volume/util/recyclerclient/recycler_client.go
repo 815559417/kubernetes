@@ -17,17 +17,20 @@ limitations under the License.
 package recyclerclient
 
 import (
+	"context"
 	"fmt"
+	"sync"
 
-	"github.com/golang/glog"
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 )
 
+// RecycleEventRecorder is a func that defines how to record RecycleEvent.
 type RecycleEventRecorder func(eventtype, message string)
 
 // RecycleVolumeByWatchingPodUntilCompletion is intended for use with volume
@@ -50,7 +53,7 @@ func RecycleVolumeByWatchingPodUntilCompletion(pvName string, pod *v1.Pod, kubeC
 // same as above func comments, except 'recyclerClient' is a narrower pod API
 // interface to ease testing
 func internalRecycleVolumeByWatchingPodUntilCompletion(pvName string, pod *v1.Pod, recyclerClient recyclerClient) error {
-	glog.V(5).Infof("creating recycler pod for volume %s\n", pod.Name)
+	klog.V(5).Infof("creating recycler pod for volume %s\n", pod.Name)
 
 	// Generate unique name for the recycler pod - we need to get "already
 	// exists" error when a previous controller has already started recycling
@@ -62,7 +65,7 @@ func internalRecycleVolumeByWatchingPodUntilCompletion(pvName string, pod *v1.Po
 	defer close(stopChannel)
 	podCh, err := recyclerClient.WatchPod(pod.Name, pod.Namespace, stopChannel)
 	if err != nil {
-		glog.V(4).Infof("cannot start watcher for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		klog.V(4).Infof("cannot start watcher for pod %s/%s: %v", pod.Namespace, pod.Name, err)
 		return err
 	}
 
@@ -83,10 +86,10 @@ func internalRecycleVolumeByWatchingPodUntilCompletion(pvName string, pod *v1.Po
 	err = waitForPod(pod, recyclerClient, podCh)
 
 	// In all cases delete the recycler pod and log its result.
-	glog.V(2).Infof("deleting recycler pod %s/%s", pod.Namespace, pod.Name)
+	klog.V(2).Infof("deleting recycler pod %s/%s", pod.Namespace, pod.Name)
 	deleteErr := recyclerClient.DeletePod(pod.Name, pod.Namespace)
 	if deleteErr != nil {
-		glog.Errorf("failed to delete recycler pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		klog.Errorf("failed to delete recycler pod %s/%s: %v", pod.Namespace, pod.Name, err)
 	}
 
 	// Returning recycler error is preferred, the pod will be deleted again on
@@ -116,7 +119,7 @@ func waitForPod(pod *v1.Pod, recyclerClient recyclerClient, podCh <-chan watch.E
 		case *v1.Pod:
 			// POD changed
 			pod := event.Object.(*v1.Pod)
-			glog.V(4).Infof("recycler pod update received: %s %s/%s %s", event.Type, pod.Namespace, pod.Name, pod.Status.Phase)
+			klog.V(4).Infof("recycler pod update received: %s %s/%s %s", event.Type, pod.Namespace, pod.Name, pod.Status.Phase)
 			switch event.Type {
 			case watch.Added, watch.Modified:
 				if pod.Status.Phase == v1.PodSucceeded {
@@ -126,9 +129,8 @@ func waitForPod(pod *v1.Pod, recyclerClient recyclerClient, podCh <-chan watch.E
 				if pod.Status.Phase == v1.PodFailed {
 					if pod.Status.Message != "" {
 						return fmt.Errorf(pod.Status.Message)
-					} else {
-						return fmt.Errorf("pod failed, pod.Status.Message unknown.")
 					}
+					return fmt.Errorf("pod failed, pod.Status.Message unknown")
 				}
 
 			case watch.Deleted:
@@ -141,7 +143,7 @@ func waitForPod(pod *v1.Pod, recyclerClient recyclerClient, podCh <-chan watch.E
 		case *v1.Event:
 			// Event received
 			podEvent := event.Object.(*v1.Event)
-			glog.V(4).Infof("recycler event received: %s %s/%s %s/%s %s", event.Type, podEvent.Namespace, podEvent.Name, podEvent.InvolvedObject.Namespace, podEvent.InvolvedObject.Name, podEvent.Message)
+			klog.V(4).Infof("recycler event received: %s %s/%s %s/%s %s", event.Type, podEvent.Namespace, podEvent.Name, podEvent.InvolvedObject.Namespace, podEvent.InvolvedObject.Name, podEvent.Message)
 			if event.Type == watch.Added {
 				recyclerClient.Event(podEvent.Type, podEvent.Message)
 			}
@@ -176,21 +178,23 @@ type realRecyclerClient struct {
 }
 
 func (c *realRecyclerClient) CreatePod(pod *v1.Pod) (*v1.Pod, error) {
-	return c.client.CoreV1().Pods(pod.Namespace).Create(pod)
+	return c.client.CoreV1().Pods(pod.Namespace).Create(context.TODO(), pod, metav1.CreateOptions{})
 }
 
 func (c *realRecyclerClient) GetPod(name, namespace string) (*v1.Pod, error) {
-	return c.client.CoreV1().Pods(namespace).Get(name, metav1.GetOptions{})
+	return c.client.CoreV1().Pods(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 }
 
 func (c *realRecyclerClient) DeletePod(name, namespace string) error {
-	return c.client.CoreV1().Pods(namespace).Delete(name, nil)
+	return c.client.CoreV1().Pods(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
 }
 
 func (c *realRecyclerClient) Event(eventtype, message string) {
 	c.recorder(eventtype, message)
 }
 
+// WatchPod watches a pod and events related to it. It sends pod updates and events over the returned channel
+// It will continue until stopChannel is closed
 func (c *realRecyclerClient) WatchPod(name, namespace string, stopChannel chan struct{}) (<-chan watch.Event, error) {
 	podSelector, err := fields.ParseSelector("metadata.name=" + name)
 	if err != nil {
@@ -201,13 +205,13 @@ func (c *realRecyclerClient) WatchPod(name, namespace string, stopChannel chan s
 		Watch:         true,
 	}
 
-	podWatch, err := c.client.CoreV1().Pods(namespace).Watch(options)
+	podWatch, err := c.client.CoreV1().Pods(namespace).Watch(context.TODO(), options)
 	if err != nil {
 		return nil, err
 	}
 
 	eventSelector, _ := fields.ParseSelector("involvedObject.name=" + name)
-	eventWatch, err := c.client.CoreV1().Events(namespace).Watch(metav1.ListOptions{
+	eventWatch, err := c.client.CoreV1().Events(namespace).Watch(context.TODO(), metav1.ListOptions{
 		FieldSelector: eventSelector.String(),
 		Watch:         true,
 	})
@@ -217,33 +221,43 @@ func (c *realRecyclerClient) WatchPod(name, namespace string, stopChannel chan s
 	}
 
 	eventCh := make(chan watch.Event, 30)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer close(eventCh)
+		wg.Wait()
+	}()
 
 	go func() {
 		defer eventWatch.Stop()
-		defer podWatch.Stop()
-		defer close(eventCh)
-		var podWatchChannelClosed bool
-		var eventWatchChannelClosed bool
+		defer wg.Done()
 		for {
 			select {
-			case _ = <-stopChannel:
+			case <-stopChannel:
+				return
+			case eventEvent, ok := <-eventWatch.ResultChan():
+				if !ok {
+					return
+				}
+				eventCh <- eventEvent
+			}
+		}
+	}()
+
+	go func() {
+		defer podWatch.Stop()
+		defer wg.Done()
+		for {
+			select {
+			case <-stopChannel:
 				return
 
 			case podEvent, ok := <-podWatch.ResultChan():
 				if !ok {
-					podWatchChannelClosed = true
-				} else {
-					eventCh <- podEvent
+					return
 				}
-			case eventEvent, ok := <-eventWatch.ResultChan():
-				if !ok {
-					eventWatchChannelClosed = true
-				} else {
-					eventCh <- eventEvent
-				}
-			}
-			if podWatchChannelClosed && eventWatchChannelClosed {
-				break
+				eventCh <- podEvent
 			}
 		}
 	}()

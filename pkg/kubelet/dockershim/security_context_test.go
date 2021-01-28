@@ -1,3 +1,5 @@
+// +build !dockerless
+
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -21,11 +23,10 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/blang/semver"
 	dockercontainer "github.com/docker/docker/api/types/container"
 	"github.com/stretchr/testify/assert"
 
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 func TestModifyContainerConfig(t *testing.T) {
@@ -59,6 +60,18 @@ func TestModifyContainerConfig(t *testing.T) {
 			},
 			isErr: false,
 		},
+		{
+			name: "container.SecurityContext.RunAsUsername and container.SecurityContext.RunAsUser set",
+			sc: &runtimeapi.LinuxContainerSecurityContext{
+				RunAsUsername: username,
+				RunAsUser:     &runtimeapi.Int64Value{Value: uid},
+			},
+			expected: &dockercontainer.Config{
+				User: username,
+			},
+			isErr: false,
+		},
+
 		{
 			name:     "no RunAsUser value set",
 			sc:       &runtimeapi.LinuxContainerSecurityContext{},
@@ -94,15 +107,27 @@ func TestModifyContainerConfig(t *testing.T) {
 			},
 			isErr: true,
 		},
+		{
+			name: "RunAsUser/RunAsUsername both set, RunAsGroup set",
+			sc: &runtimeapi.LinuxContainerSecurityContext{
+				RunAsUser:     &runtimeapi.Int64Value{Value: uid},
+				RunAsUsername: username,
+				RunAsGroup:    &runtimeapi.Int64Value{Value: gid},
+			},
+			expected: &dockercontainer.Config{
+				User: "testuser:423",
+			},
+			isErr: false,
+		},
 	}
 
 	for _, tc := range cases {
 		dockerCfg := &dockercontainer.Config{}
 		err := modifyContainerConfig(tc.sc, dockerCfg)
 		if tc.isErr {
-			assert.NotNil(t, err)
+			assert.Error(t, err)
 		} else {
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 			assert.Equal(t, tc.expected, dockerCfg, "[Test case %q]", tc.name)
 		}
 	}
@@ -110,11 +135,27 @@ func TestModifyContainerConfig(t *testing.T) {
 
 func TestModifyHostConfig(t *testing.T) {
 	setNetworkHC := &dockercontainer.HostConfig{}
+
+	// When we have Privileged pods, we do not need to use the
+	// Masked / Readonly paths.
 	setPrivSC := &runtimeapi.LinuxContainerSecurityContext{}
 	setPrivSC.Privileged = true
+	setPrivSC.MaskedPaths = []string{"/hello/world/masked"}
+	setPrivSC.ReadonlyPaths = []string{"/hello/world/readonly"}
 	setPrivHC := &dockercontainer.HostConfig{
 		Privileged: true,
 	}
+
+	unsetPrivSC := &runtimeapi.LinuxContainerSecurityContext{}
+	unsetPrivSC.Privileged = false
+	unsetPrivSC.MaskedPaths = []string{"/hello/world/masked"}
+	unsetPrivSC.ReadonlyPaths = []string{"/hello/world/readonly"}
+	unsetPrivHC := &dockercontainer.HostConfig{
+		Privileged:    false,
+		MaskedPaths:   []string{"/hello/world/masked"},
+		ReadonlyPaths: []string{"/hello/world/readonly"},
+	}
+
 	setCapsHC := &dockercontainer.HostConfig{
 		CapAdd:  []string{"addCapA", "addCapB"},
 		CapDrop: []string{"dropCapA", "dropCapB"},
@@ -147,6 +188,11 @@ func TestModifyHostConfig(t *testing.T) {
 			name:     "container.SecurityContext.Privileged",
 			sc:       setPrivSC,
 			expected: setPrivHC,
+		},
+		{
+			name:     "container.SecurityContext.NoPrivileges",
+			sc:       unsetPrivSC,
+			expected: unsetPrivHC,
 		},
 		{
 			name: "container.SecurityContext.Capabilities",
@@ -301,6 +347,27 @@ func TestModifySandboxNamespaceOptions(t *testing.T) {
 				NetworkMode: "default",
 			},
 		},
+		{
+			name: "Pod PID NamespaceOption (for sandbox is same as container ns option)",
+			nsOpt: &runtimeapi.NamespaceOption{
+				Pid: runtimeapi.NamespaceMode_POD,
+			},
+			expected: &dockercontainer.HostConfig{
+				PidMode:     "",
+				NetworkMode: "default",
+			},
+		},
+		{
+			name: "Target PID NamespaceOption (invalid for sandbox)",
+			nsOpt: &runtimeapi.NamespaceOption{
+				Pid:      runtimeapi.NamespaceMode_TARGET,
+				TargetId: "same-container",
+			},
+			expected: &dockercontainer.HostConfig{
+				PidMode:     "",
+				NetworkMode: "default",
+			},
+		},
 	}
 	for _, tc := range cases {
 		dockerCfg := &dockercontainer.HostConfig{}
@@ -351,110 +418,34 @@ func TestModifyContainerNamespaceOptions(t *testing.T) {
 				PidMode:     namespaceModeHost,
 			},
 		},
+		{
+			name: "Pod PID NamespaceOption",
+			nsOpt: &runtimeapi.NamespaceOption{
+				Pid: runtimeapi.NamespaceMode_POD,
+			},
+			expected: &dockercontainer.HostConfig{
+				NetworkMode: dockercontainer.NetworkMode(sandboxNSMode),
+				IpcMode:     dockercontainer.IpcMode(sandboxNSMode),
+				PidMode:     dockercontainer.PidMode(sandboxNSMode),
+			},
+		},
+		{
+			name: "Target PID NamespaceOption",
+			nsOpt: &runtimeapi.NamespaceOption{
+				Pid:      runtimeapi.NamespaceMode_TARGET,
+				TargetId: "some-container",
+			},
+			expected: &dockercontainer.HostConfig{
+				NetworkMode: dockercontainer.NetworkMode(sandboxNSMode),
+				IpcMode:     dockercontainer.IpcMode(sandboxNSMode),
+				PidMode:     dockercontainer.PidMode("container:some-container"),
+			},
+		},
 	}
 	for _, tc := range cases {
 		dockerCfg := &dockercontainer.HostConfig{}
 		modifyContainerNamespaceOptions(tc.nsOpt, sandboxID, dockerCfg)
 		assert.Equal(t, tc.expected, dockerCfg, "[Test case %q]", tc.name)
-	}
-}
-
-func TestModifyContainerNamespacePIDOverride(t *testing.T) {
-	cases := []struct {
-		name            string
-		disable         bool
-		version         *semver.Version
-		input, expected dockercontainer.PidMode
-	}{
-		{
-			name:     "mode:CONTAINER docker:NEW flag:UNSET",
-			disable:  true,
-			version:  &semver.Version{Major: 1, Minor: 26},
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "mode:CONTAINER docker:NEW flag:SET",
-			disable:  false,
-			version:  &semver.Version{Major: 1, Minor: 26},
-			input:    "",
-			expected: "container:sandbox",
-		},
-		{
-			name:     "mode:CONTAINER docker:OLD flag:UNSET",
-			disable:  true,
-			version:  &semver.Version{Major: 1, Minor: 25},
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "mode:CONTAINER docker:OLD flag:SET",
-			disable:  false,
-			version:  &semver.Version{Major: 1, Minor: 25},
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "mode:HOST docker:NEW flag:UNSET",
-			disable:  true,
-			version:  &semver.Version{Major: 1, Minor: 26},
-			input:    "host",
-			expected: "host",
-		},
-		{
-			name:     "mode:HOST docker:NEW flag:SET",
-			disable:  false,
-			version:  &semver.Version{Major: 1, Minor: 26},
-			input:    "host",
-			expected: "host",
-		},
-		{
-			name:     "mode:HOST docker:OLD flag:UNSET",
-			disable:  true,
-			version:  &semver.Version{Major: 1, Minor: 25},
-			input:    "host",
-			expected: "host",
-		},
-		{
-			name:     "mode:HOST docker:OLD flag:SET",
-			disable:  false,
-			version:  &semver.Version{Major: 1, Minor: 25},
-			input:    "host",
-			expected: "host",
-		},
-		{
-			name:     "mode:POD docker:NEW flag:UNSET",
-			disable:  true,
-			version:  &semver.Version{Major: 1, Minor: 26},
-			input:    "container:sandbox",
-			expected: "container:sandbox",
-		},
-		{
-			name:     "mode:POD docker:NEW flag:SET",
-			disable:  false,
-			version:  &semver.Version{Major: 1, Minor: 26},
-			input:    "container:sandbox",
-			expected: "container:sandbox",
-		},
-		{
-			name:     "mode:POD docker:OLD flag:UNSET",
-			disable:  true,
-			version:  &semver.Version{Major: 1, Minor: 25},
-			input:    "container:sandbox",
-			expected: "",
-		},
-		{
-			name:     "mode:POD docker:OLD flag:SET",
-			disable:  false,
-			version:  &semver.Version{Major: 1, Minor: 25},
-			input:    "container:sandbox",
-			expected: "",
-		},
-	}
-	for _, tc := range cases {
-		dockerCfg := &dockercontainer.HostConfig{PidMode: tc.input}
-		modifyContainerPIDNamespaceOverrides(tc.disable, tc.version, dockerCfg, "sandbox")
-		assert.Equal(t, tc.expected, dockerCfg.PidMode, "[Test case %q]", tc.name)
 	}
 }
 

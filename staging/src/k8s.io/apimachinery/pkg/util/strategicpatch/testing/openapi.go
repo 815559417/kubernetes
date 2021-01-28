@@ -23,8 +23,8 @@ import (
 
 	"gopkg.in/yaml.v2"
 
-	"github.com/googleapis/gnostic/OpenAPIv2"
 	"github.com/googleapis/gnostic/compiler"
+	openapi_v2 "github.com/googleapis/gnostic/openapiv2"
 	openapi "k8s.io/kube-openapi/pkg/util/proto"
 )
 
@@ -62,7 +62,7 @@ func (f *Fake) OpenAPISchema() (*openapi_v2.Document, error) {
 	return f.document, f.err
 }
 
-func getSchema(f Fake, model string) (openapi.Schema, error) {
+func getSchema(f *Fake, model string) (openapi.Schema, error) {
 	s, err := f.OpenAPISchema()
 	if err != nil {
 		return nil, err
@@ -74,8 +74,8 @@ func getSchema(f Fake, model string) (openapi.Schema, error) {
 	return m.LookupModel(model), nil
 }
 
-// GetSchemaOrDie returns returns the openapi schema.
-func GetSchemaOrDie(f Fake, model string) openapi.Schema {
+// GetSchemaOrDie returns the openapi schema.
+func GetSchemaOrDie(f *Fake, model string) openapi.Schema {
 	s, err := getSchema(f, model)
 	if err != nil {
 		panic(err)

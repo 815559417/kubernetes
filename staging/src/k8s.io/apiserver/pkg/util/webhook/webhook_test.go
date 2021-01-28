@@ -17,9 +17,11 @@ limitations under the License.
 package webhook
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -32,11 +34,12 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apimachinery/registered"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd/api/v1"
+	v1 "k8s.io/client-go/tools/clientcmd/api/v1"
 )
 
 const (
@@ -49,7 +52,7 @@ const (
 var (
 	defaultCluster = v1.NamedCluster{
 		Cluster: v1.Cluster{
-			Server: "https://webhook.example.com",
+			Server:                   "https://webhook.example.com",
 			CertificateAuthorityData: caCert,
 		},
 	}
@@ -61,33 +64,14 @@ var (
 	}
 	namedCluster = v1.NamedCluster{
 		Cluster: v1.Cluster{
-			Server: "https://webhook.example.com",
+			Server:                   "https://webhook.example.com",
 			CertificateAuthorityData: caCert,
 		},
 		Name: "test-cluster",
 	}
 	groupVersions = []schema.GroupVersion{}
-	retryBackoff  = time.Duration(500) * time.Millisecond
+	retryBackoff  = DefaultRetryBackoffWithInitialDelay(time.Duration(500) * time.Millisecond)
 )
-
-// TestDisabledGroupVersion ensures that requiring a group version works as expected
-func TestDisabledGroupVersion(t *testing.T) {
-	gv := schema.GroupVersion{Group: "webhook.util.k8s.io", Version: "v1"}
-	gvs := []schema.GroupVersion{gv}
-	registry := registered.NewOrDie(gv.String())
-	_, err := NewGenericWebhook(registry, scheme.Codecs, "/some/path", gvs, retryBackoff)
-
-	if err == nil {
-		t.Errorf("expected an error")
-	} else {
-		aErrMsg := err.Error()
-		eErrMsg := fmt.Sprintf("webhook plugin requires enabling extension resource: %s", gv)
-
-		if aErrMsg != eErrMsg {
-			t.Errorf("unexpected error message mismatch:\n  Expected: %s\n  Actual:   %s", eErrMsg, aErrMsg)
-		}
-	}
-}
 
 // TestKubeConfigFile ensures that a kube config file, regardless of validity, is handled properly
 func TestKubeConfigFile(t *testing.T) {
@@ -178,7 +162,7 @@ func TestKubeConfigFile(t *testing.T) {
 			test: "cluster with invalid CA certificate ",
 			cluster: &v1.NamedCluster{
 				Cluster: v1.Cluster{
-					Server: namedCluster.Cluster.Server,
+					Server:                   namedCluster.Cluster.Server,
 					CertificateAuthorityData: caKey,
 				},
 			},
@@ -277,7 +261,7 @@ func TestKubeConfigFile(t *testing.T) {
 			if err == nil {
 				defer os.Remove(kubeConfigFile)
 
-				_, err = NewGenericWebhook(registered.NewOrDie(""), scheme.Codecs, kubeConfigFile, groupVersions, retryBackoff)
+				_, err = NewGenericWebhook(runtime.NewScheme(), scheme.Codecs, kubeConfigFile, groupVersions, retryBackoff, nil)
 			}
 
 			return err
@@ -300,7 +284,7 @@ func TestKubeConfigFile(t *testing.T) {
 // TestMissingKubeConfigFile ensures that a kube config path to a missing file is handled properly
 func TestMissingKubeConfigFile(t *testing.T) {
 	kubeConfigPath := "/some/missing/path"
-	_, err := NewGenericWebhook(registered.NewOrDie(""), scheme.Codecs, kubeConfigPath, groupVersions, retryBackoff)
+	_, err := NewGenericWebhook(runtime.NewScheme(), scheme.Codecs, kubeConfigPath, groupVersions, retryBackoff, nil)
 
 	if err == nil {
 		t.Errorf("creating the webhook should had failed")
@@ -390,7 +374,7 @@ func TestTLSConfig(t *testing.T) {
 				Clusters: []v1.NamedCluster{
 					{
 						Cluster: v1.Cluster{
-							Server: server.URL,
+							Server:                   server.URL,
 							CertificateAuthorityData: tt.clientCA,
 						},
 					},
@@ -412,10 +396,10 @@ func TestTLSConfig(t *testing.T) {
 
 			defer os.Remove(configFile)
 
-			wh, err := NewGenericWebhook(registered.NewOrDie(""), scheme.Codecs, configFile, groupVersions, retryBackoff)
+			wh, err := NewGenericWebhook(runtime.NewScheme(), scheme.Codecs, configFile, groupVersions, retryBackoff, nil)
 
 			if err == nil {
-				err = wh.RestClient.Get().Do().Error()
+				err = wh.RestClient.Get().Do(context.TODO()).Error()
 			}
 
 			if err == nil {
@@ -438,7 +422,6 @@ func TestRequestTimeout(t *testing.T) {
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		<-done
-		return
 	}
 
 	// Create and start a simple HTTPS server
@@ -455,7 +438,7 @@ func TestRequestTimeout(t *testing.T) {
 		Clusters: []v1.NamedCluster{
 			{
 				Cluster: v1.Cluster{
-					Server: server.URL,
+					Server:                   server.URL,
 					CertificateAuthorityData: caCert,
 				},
 			},
@@ -477,14 +460,14 @@ func TestRequestTimeout(t *testing.T) {
 
 	var requestTimeout = 10 * time.Millisecond
 
-	wh, err := newGenericWebhook(registered.NewOrDie(""), scheme.Codecs, configFile, groupVersions, retryBackoff, requestTimeout)
+	wh, err := newGenericWebhook(runtime.NewScheme(), scheme.Codecs, configFile, groupVersions, retryBackoff, requestTimeout, nil)
 	if err != nil {
 		t.Fatalf("failed to create the webhook: %v", err)
 	}
 
 	resultCh := make(chan rest.Result)
 
-	go func() { resultCh <- wh.RestClient.Get().Do() }()
+	go func() { resultCh <- wh.RestClient.Get().Do(context.TODO()) }()
 	select {
 	case <-time.After(time.Second * 5):
 		t.Errorf("expected request to timeout after %s", requestTimeout)
@@ -541,7 +524,7 @@ func TestWithExponentialBackoff(t *testing.T) {
 		Clusters: []v1.NamedCluster{
 			{
 				Cluster: v1.Cluster{
-					Server: server.URL,
+					Server:                   server.URL,
 					CertificateAuthorityData: caCert,
 				},
 			},
@@ -563,14 +546,14 @@ func TestWithExponentialBackoff(t *testing.T) {
 
 	defer os.Remove(configFile)
 
-	wh, err := NewGenericWebhook(registered.NewOrDie(""), scheme.Codecs, configFile, groupVersions, retryBackoff)
+	wh, err := NewGenericWebhook(runtime.NewScheme(), scheme.Codecs, configFile, groupVersions, retryBackoff, nil)
 
 	if err != nil {
 		t.Fatalf("failed to create the webhook: %v", err)
 	}
 
-	result := wh.WithExponentialBackoff(func() rest.Result {
-		return wh.RestClient.Get().Do()
+	result := wh.WithExponentialBackoff(context.Background(), func() rest.Result {
+		return wh.RestClient.Get().Do(context.TODO())
 	})
 
 	var statusCode int
@@ -581,8 +564,8 @@ func TestWithExponentialBackoff(t *testing.T) {
 		t.Errorf("unexpected status code: %d", statusCode)
 	}
 
-	result = wh.WithExponentialBackoff(func() rest.Result {
-		return wh.RestClient.Get().Do()
+	result = wh.WithExponentialBackoff(context.Background(), func() rest.Result {
+		return wh.RestClient.Get().Do(context.TODO())
 	})
 
 	result.StatusCode(&statusCode)
@@ -670,4 +653,140 @@ func newTestServer(clientCert, clientKey, caCert []byte, handler func(http.Respo
 	server.StartTLS()
 
 	return server, nil
+}
+
+func TestWithExponentialBackoffContextIsAlreadyCanceled(t *testing.T) {
+	alwaysRetry := func(e error) bool {
+		return true
+	}
+
+	attemptsGot := 0
+	webhookFunc := func() error {
+		attemptsGot++
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	cancel()
+
+	// We don't expect the webhook function to be called since the context is already canceled.
+	retryBackoff := wait.Backoff{Steps: 5}
+	err := WithExponentialBackoff(ctx, retryBackoff, webhookFunc, alwaysRetry)
+
+	errExpected := fmt.Errorf("webhook call failed: %s", context.Canceled)
+	if errExpected.Error() != err.Error() {
+		t.Errorf("expected error: %v, but got: %v", errExpected, err)
+	}
+	if attemptsGot != 0 {
+		t.Errorf("expected %d webhook attempts, but got: %d", 0, attemptsGot)
+	}
+}
+
+func TestWithExponentialBackoffWebhookErrorIsMostImportant(t *testing.T) {
+	alwaysRetry := func(e error) bool {
+		return true
+	}
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	attemptsGot := 0
+	errExpected := errors.New("webhook not available")
+	webhookFunc := func() error {
+		attemptsGot++
+
+		// after the first attempt, the context is canceled
+		cancel()
+
+		return errExpected
+	}
+
+	// webhook err has higher priority than ctx error. we expect the webhook error to be returned.
+	retryBackoff := wait.Backoff{Steps: 5}
+	err := WithExponentialBackoff(ctx, retryBackoff, webhookFunc, alwaysRetry)
+
+	if attemptsGot != 1 {
+		t.Errorf("expected %d webhook attempts, but got: %d", 1, attemptsGot)
+	}
+	if errExpected != err {
+		t.Errorf("expected error: %v, but got: %v", errExpected, err)
+	}
+}
+
+func TestWithExponentialBackoffWithRetryExhaustedWhileContextIsNotCanceled(t *testing.T) {
+	alwaysRetry := func(e error) bool {
+		return true
+	}
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
+	attemptsGot := 0
+	errExpected := errors.New("webhook not available")
+	webhookFunc := func() error {
+		attemptsGot++
+		return errExpected
+	}
+
+	// webhook err has higher priority than ctx error. we expect the webhook error to be returned.
+	retryBackoff := wait.Backoff{Steps: 5}
+	err := WithExponentialBackoff(ctx, retryBackoff, webhookFunc, alwaysRetry)
+
+	if attemptsGot != 5 {
+		t.Errorf("expected %d webhook attempts, but got: %d", 1, attemptsGot)
+	}
+	if errExpected != err {
+		t.Errorf("expected error: %v, but got: %v", errExpected, err)
+	}
+}
+
+func TestWithExponentialBackoffParametersNotSet(t *testing.T) {
+	alwaysRetry := func(e error) bool {
+		return true
+	}
+
+	attemptsGot := 0
+	webhookFunc := func() error {
+		attemptsGot++
+		return nil
+	}
+
+	err := WithExponentialBackoff(context.TODO(), wait.Backoff{}, webhookFunc, alwaysRetry)
+
+	errExpected := fmt.Errorf("webhook call failed: %s", wait.ErrWaitTimeout)
+	if errExpected.Error() != err.Error() {
+		t.Errorf("expected error: %v, but got: %v", errExpected, err)
+	}
+	if attemptsGot != 0 {
+		t.Errorf("expected %d webhook attempts, but got: %d", 0, attemptsGot)
+	}
+}
+
+func TestGenericWebhookWithExponentialBackoff(t *testing.T) {
+	attemptsPerCallExpected := 5
+	webhook := &GenericWebhook{
+		RetryBackoff: wait.Backoff{
+			Duration: time.Millisecond,
+			Factor:   1.5,
+			Jitter:   0.2,
+			Steps:    attemptsPerCallExpected,
+		},
+
+		ShouldRetry: func(e error) bool {
+			return true
+		},
+	}
+
+	attemptsGot := 0
+	webhookFunc := func() rest.Result {
+		attemptsGot++
+		return rest.Result{}
+	}
+
+	// number of retries should always be local to each call.
+	totalAttemptsExpected := attemptsPerCallExpected * 2
+	webhook.WithExponentialBackoff(context.TODO(), webhookFunc)
+	webhook.WithExponentialBackoff(context.TODO(), webhookFunc)
+
+	if totalAttemptsExpected != attemptsGot {
+		t.Errorf("expected a total of %d webhook attempts but got: %d", totalAttemptsExpected, attemptsGot)
+	}
 }

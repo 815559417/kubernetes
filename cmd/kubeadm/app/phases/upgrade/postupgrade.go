@@ -17,44 +17,63 @@ limitations under the License.
 package upgrade
 
 import (
-	"fmt"
+	"context"
 	"os"
-	"path/filepath"
-	"time"
 
+	"github.com/pkg/errors"
+
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	errorsutil "k8s.io/apimachinery/pkg/util/errors"
 	clientset "k8s.io/client-go/kubernetes"
-	certutil "k8s.io/client-go/util/cert"
+	"k8s.io/klog/v2"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiext "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1alpha1"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/cmd/kubeadm/app/features"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/addons/dns"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/addons/proxy"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/clusterinfo"
 	nodebootstraptoken "k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/node"
-	certsphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
-	"k8s.io/kubernetes/cmd/kubeadm/app/phases/selfhosting"
+	kubeletphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubelet"
+	patchnodephase "k8s.io/kubernetes/cmd/kubeadm/app/phases/patchnode"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/uploadconfig"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 	dryrunutil "k8s.io/kubernetes/cmd/kubeadm/app/util/dryrun"
-	"k8s.io/kubernetes/pkg/util/version"
 )
 
-var v190alpha3 = version.MustParseSemantic("v1.9.0-alpha.3")
-var expiry = 180 * 24 * time.Hour
-
 // PerformPostUpgradeTasks runs nearly the same functions as 'kubeadm init' would do
-// Note that the markmaster phase is left out, not needed, and no token is created as that doesn't belong to the upgrade
-func PerformPostUpgradeTasks(client clientset.Interface, cfg *kubeadmapi.MasterConfiguration, newK8sVer *version.Version, dryRun bool) error {
+// Note that the mark-control-plane phase is left out, not needed, and no token is created as that doesn't belong to the upgrade
+func PerformPostUpgradeTasks(client clientset.Interface, cfg *kubeadmapi.InitConfiguration, dryRun bool) error {
 	errs := []error{}
 
 	// Upload currently used configuration to the cluster
 	// Note: This is done right in the beginning of cluster initialization; as we might want to make other phases
 	// depend on centralized information from this source in the future
 	if err := uploadconfig.UploadConfiguration(cfg, client); err != nil {
+		errs = append(errs, err)
+	}
+
+	// Create the new, version-branched kubelet ComponentConfig ConfigMap
+	if err := kubeletphase.CreateConfigMap(&cfg.ClusterConfiguration, client); err != nil {
+		errs = append(errs, errors.Wrap(err, "error creating kubelet configuration ConfigMap"))
+	}
+
+	// Write the new kubelet config down to disk and the env file if needed
+	if err := writeKubeletConfigFiles(client, cfg, dryRun); err != nil {
+		errs = append(errs, err)
+	}
+
+	// Annotate the node with the crisocket information, sourced either from the InitConfiguration struct or
+	// --cri-socket.
+	// TODO: In the future we want to use something more official like NodeStatus or similar for detecting this properly
+	if err := patchnodephase.AnnotateCRISocket(client, cfg.NodeRegistration.Name, cfg.NodeRegistration.CRISocket); err != nil {
+		errs = append(errs, errors.Wrap(err, "error uploading crisocket"))
+	}
+
+	// Create RBAC rules that makes the bootstrap tokens able to get nodes
+	if err := nodebootstraptoken.AllowBoostrapTokensToGetNodes(client); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -73,11 +92,6 @@ func PerformPostUpgradeTasks(client clientset.Interface, cfg *kubeadmapi.MasterC
 		errs = append(errs, err)
 	}
 
-	// Upgrade to a self-hosted control plane if possible
-	if err := upgradeToSelfHosting(client, cfg, newK8sVer, dryRun); err != nil {
-		errs = append(errs, err)
-	}
-
 	// TODO: Is this needed to do here? I think that updating cluster info should probably be separate from a normal upgrade
 	// Create the cluster-info ConfigMap with the associated RBAC rules
 	// if err := clusterinfo.CreateBootstrapConfigMapIfNotExists(client, kubeadmconstants.GetAdminKubeConfigPath()); err != nil {
@@ -88,93 +102,133 @@ func PerformPostUpgradeTasks(client clientset.Interface, cfg *kubeadmapi.MasterC
 		errs = append(errs, err)
 	}
 
-	certAndKeyDir := kubeadmapiext.DefaultCertificatesDir
-	shouldBackup, err := shouldBackupAPIServerCertAndKey(certAndKeyDir)
-	// Don't fail the upgrade phase if failing to determine to backup kube-apiserver cert and key.
-	if err != nil {
-		fmt.Printf("[postupgrade] WARNING: failed to determine to backup kube-apiserver cert and key: %v", err)
-	} else if shouldBackup {
-		// Don't fail the upgrade phase if failing to backup kube-apiserver cert and key.
-		if err := backupAPIServerCertAndKey(certAndKeyDir); err != nil {
-			fmt.Printf("[postupgrade] WARNING: failed to backup kube-apiserver cert and key: %v", err)
+	// If the coredns / kube-dns ConfigMaps are missing, show a warning and assume that the
+	// DNS addon was skipped during "kubeadm init", and that its redeployment on upgrade is not desired.
+	//
+	// TODO: remove this once "kubeadm upgrade apply" phases are supported:
+	//   https://github.com/kubernetes/kubeadm/issues/1318
+	var missingCoreDNSConfigMap, missingKubeDNSConfigMap bool
+	if _, err := client.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(
+		context.TODO(),
+		kubeadmconstants.CoreDNSConfigMap,
+		metav1.GetOptions{},
+	); err != nil && apierrors.IsNotFound(err) {
+		missingCoreDNSConfigMap = true
+	}
+	if _, err := client.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(
+		context.TODO(),
+		kubeadmconstants.KubeDNSConfigMap,
+		metav1.GetOptions{},
+	); err != nil && apierrors.IsNotFound(err) {
+		missingKubeDNSConfigMap = true
+	}
+	if missingCoreDNSConfigMap && missingKubeDNSConfigMap {
+		klog.Warningf("the ConfigMaps %q/%q in the namespace %q were not found. "+
+			"Assuming that a DNS server was not deployed for this cluster. "+
+			"Note that once 'kubeadm upgrade apply' supports phases you "+
+			"will have to skip the DNS upgrade manually",
+			kubeadmconstants.CoreDNSConfigMap,
+			kubeadmconstants.KubeDNSConfigMap,
+			metav1.NamespaceSystem)
+	} else {
+		// Upgrade CoreDNS/kube-dns
+		if err := dns.EnsureDNSAddon(&cfg.ClusterConfiguration, client); err != nil {
+			errs = append(errs, err)
 		}
-		if err := certsphase.CreateAPIServerCertAndKeyFiles(cfg); err != nil {
+		// Remove the old DNS deployment if a new DNS service is now used (kube-dns to CoreDNS or vice versa)
+		if err := removeOldDNSDeploymentIfAnotherDNSIsUsed(&cfg.ClusterConfiguration, client, dryRun); err != nil {
 			errs = append(errs, err)
 		}
 	}
 
-	// Upgrade kube-dns and kube-proxy
-	if err := dns.EnsureDNSAddon(cfg, client); err != nil {
-		errs = append(errs, err)
-	}
-	// Remove the old kube-dns deployment if coredns is now used
-	if !dryRun {
-		if err := removeOldKubeDNSDeploymentIfCoreDNSIsUsed(cfg, client); err != nil {
+	// If the kube-proxy ConfigMap is missing, show a warning and assume that kube-proxy
+	// was skipped during "kubeadm init", and that its redeployment on upgrade is not desired.
+	//
+	// TODO: remove this once "kubeadm upgrade apply" phases are supported:
+	//   https://github.com/kubernetes/kubeadm/issues/1318
+	if _, err := client.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(
+		context.TODO(),
+		kubeadmconstants.KubeProxyConfigMap,
+		metav1.GetOptions{},
+	); err != nil && apierrors.IsNotFound(err) {
+		klog.Warningf("the ConfigMap %q in the namespace %q was not found. "+
+			"Assuming that kube-proxy was not deployed for this cluster. "+
+			"Note that once 'kubeadm upgrade apply' supports phases you "+
+			"will have to skip the kube-proxy upgrade manually",
+			kubeadmconstants.KubeProxyConfigMap,
+			metav1.NamespaceSystem)
+	} else {
+		// Upgrade kube-proxy
+		if err := proxy.EnsureProxyAddon(&cfg.ClusterConfiguration, &cfg.LocalAPIEndpoint, client); err != nil {
 			errs = append(errs, err)
 		}
 	}
 
-	if err := proxy.EnsureProxyAddon(cfg, client); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.NewAggregate(errs)
+	return errorsutil.NewAggregate(errs)
 }
 
-func removeOldKubeDNSDeploymentIfCoreDNSIsUsed(cfg *kubeadmapi.MasterConfiguration, client clientset.Interface) error {
-	if features.Enabled(cfg.FeatureGates, features.CoreDNS) {
-		return apiclient.TryRunCommand(func() error {
-			coreDNSDeployment, err := client.AppsV1().Deployments(metav1.NamespaceSystem).Get(kubeadmconstants.CoreDNS, metav1.GetOptions{})
+func removeOldDNSDeploymentIfAnotherDNSIsUsed(cfg *kubeadmapi.ClusterConfiguration, client clientset.Interface, dryRun bool) error {
+	return apiclient.TryRunCommand(func() error {
+		installedDeploymentName := kubeadmconstants.KubeDNSDeploymentName
+		deploymentToDelete := kubeadmconstants.CoreDNSDeploymentName
+
+		if cfg.DNS.Type == kubeadmapi.CoreDNS {
+			installedDeploymentName = kubeadmconstants.CoreDNSDeploymentName
+			deploymentToDelete = kubeadmconstants.KubeDNSDeploymentName
+		}
+
+		nodes, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{
+			FieldSelector: fields.Set{"spec.unschedulable": "false"}.AsSelector().String(),
+		})
+		if err != nil {
+			return err
+		}
+
+		// If we're dry-running or there are no schedulable nodes available, we don't need to wait for the new DNS addon to become ready
+		if !dryRun && len(nodes.Items) != 0 {
+			dnsDeployment, err := client.AppsV1().Deployments(metav1.NamespaceSystem).Get(context.TODO(), installedDeploymentName, metav1.GetOptions{})
 			if err != nil {
 				return err
 			}
-			if coreDNSDeployment.Status.ReadyReplicas == 0 {
-				return fmt.Errorf("the CoreDNS deployment isn't ready yet")
+			if dnsDeployment.Status.ReadyReplicas == 0 {
+				return errors.New("the DNS deployment isn't ready yet")
 			}
-			err = apiclient.DeleteDeploymentForeground(client, metav1.NamespaceSystem, kubeadmconstants.KubeDNS)
-			if err != nil && !apierrors.IsNotFound(err) {
-				return err
-			}
-			return nil
-		}, 10)
-	}
-	return nil
-}
-
-func upgradeToSelfHosting(client clientset.Interface, cfg *kubeadmapi.MasterConfiguration, newK8sVer *version.Version, dryRun bool) error {
-	if features.Enabled(cfg.FeatureGates, features.SelfHosting) && !IsControlPlaneSelfHosted(client) && newK8sVer.AtLeast(v190alpha3) {
-
-		waiter := getWaiter(dryRun, client)
-
-		// kubeadm will now convert the static Pod-hosted control plane into a self-hosted one
-		fmt.Println("[self-hosted] Creating self-hosted control plane.")
-		if err := selfhosting.CreateSelfHostedControlPlane(kubeadmconstants.GetStaticPodDirectory(), kubeadmconstants.KubernetesDir, cfg, client, waiter, dryRun); err != nil {
-			return fmt.Errorf("error creating self hosted control plane: %v", err)
 		}
-	}
-	return nil
+
+		// We don't want to wait for the DNS deployment above to become ready when dryrunning (as it never will)
+		// but here we should execute the DELETE command against the dryrun clientset, as it will only be logged
+		err = apiclient.DeleteDeploymentForeground(client, metav1.NamespaceSystem, deploymentToDelete)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	}, 10)
 }
 
-// getWaiter gets the right waiter implementation for the right occasion
-// TODO: Consolidate this with what's in init.go?
-func getWaiter(dryRun bool, client clientset.Interface) apiclient.Waiter {
+func writeKubeletConfigFiles(client clientset.Interface, cfg *kubeadmapi.InitConfiguration, dryRun bool) error {
+	kubeletDir, err := GetKubeletDir(dryRun)
+	if err != nil {
+		// The error here should never occur in reality, would only be thrown if /tmp doesn't exist on the machine.
+		return err
+	}
+	errs := []error{}
+	// Write the configuration for the kubelet down to disk so the upgraded kubelet can start with fresh config
+	if err := kubeletphase.WriteConfigToDisk(&cfg.ClusterConfiguration, kubeletDir); err != nil {
+		errs = append(errs, errors.Wrap(err, "error writing kubelet configuration to file"))
+	}
+
+	if dryRun { // Print what contents would be written
+		dryrunutil.PrintDryRunFile(kubeadmconstants.KubeletConfigurationFileName, kubeletDir, kubeadmconstants.KubeletRunDirectory, os.Stdout)
+	}
+	return errorsutil.NewAggregate(errs)
+}
+
+// GetKubeletDir gets the kubelet directory based on whether the user is dry-running this command or not.
+func GetKubeletDir(dryRun bool) (string, error) {
 	if dryRun {
-		return dryrunutil.NewWaiter()
+		return kubeadmconstants.CreateTempDirForKubeadm("", "kubeadm-upgrade-dryrun")
 	}
-	return apiclient.NewKubeWaiter(client, 30*time.Minute, os.Stdout)
-}
-
-// backupAPIServerCertAndKey backups the old cert and key of kube-apiserver to a specified directory.
-func backupAPIServerCertAndKey(certAndKeyDir string) error {
-	subDir := filepath.Join(certAndKeyDir, "expired")
-	if err := os.Mkdir(subDir, 0766); err != nil {
-		return fmt.Errorf("failed to created backup directory %s: %v", subDir, err)
-	}
-
-	filesToMove := map[string]string{
-		filepath.Join(certAndKeyDir, kubeadmconstants.APIServerCertName): filepath.Join(subDir, kubeadmconstants.APIServerCertName),
-		filepath.Join(certAndKeyDir, kubeadmconstants.APIServerKeyName):  filepath.Join(subDir, kubeadmconstants.APIServerKeyName),
-	}
-	return moveFiles(filesToMove)
+	return kubeadmconstants.KubeletRunDirectory, nil
 }
 
 // moveFiles moves files from one directory to another.
@@ -197,23 +251,33 @@ func rollbackFiles(files map[string]string, originalErr error) error {
 			errs = append(errs, err)
 		}
 	}
-	return fmt.Errorf("couldn't move these files: %v. Got errors: %v", files, errors.NewAggregate(errs))
+	return errors.Errorf("couldn't move these files: %v. Got errors: %v", files, errorsutil.NewAggregate(errs))
 }
 
-// shouldBackupAPIServerCertAndKey checks if the cert of kube-apiserver will be expired in 180 days.
-func shouldBackupAPIServerCertAndKey(certAndKeyDir string) (bool, error) {
-	apiServerCert := filepath.Join(certAndKeyDir, kubeadmconstants.APIServerCertName)
-	certs, err := certutil.CertsFromFile(apiServerCert)
+// LabelOldControlPlaneNodes finds all nodes with the legacy node-role label and also applies
+// the "control-plane" node-role label to them.
+// TODO: https://github.com/kubernetes/kubeadm/issues/2200
+func LabelOldControlPlaneNodes(client clientset.Interface) error {
+	selectorOldControlPlane := labels.SelectorFromSet(labels.Set(map[string]string{
+		kubeadmconstants.LabelNodeRoleOldControlPlane: "",
+	}))
+	nodesWithOldLabel, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{
+		LabelSelector: selectorOldControlPlane.String(),
+	})
 	if err != nil {
-		return false, fmt.Errorf("couldn't load the certificate file %s: %v", apiServerCert, err)
-	}
-	if len(certs) == 0 {
-		return false, fmt.Errorf("no certificate data found")
+		return errors.Wrapf(err, "could not list nodes labeled with %q", kubeadmconstants.LabelNodeRoleOldControlPlane)
 	}
 
-	if time.Now().Sub(certs[0].NotBefore) > expiry {
-		return true, nil
+	for _, n := range nodesWithOldLabel.Items {
+		if _, hasNewLabel := n.ObjectMeta.Labels[kubeadmconstants.LabelNodeRoleControlPlane]; hasNewLabel {
+			continue
+		}
+		err = apiclient.PatchNode(client, n.Name, func(n *v1.Node) {
+			n.ObjectMeta.Labels[kubeadmconstants.LabelNodeRoleControlPlane] = ""
+		})
+		if err != nil {
+			return err
+		}
 	}
-
-	return false, nil
+	return nil
 }

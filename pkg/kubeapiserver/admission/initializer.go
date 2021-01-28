@@ -19,27 +19,11 @@ package admission
 import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apiserver/pkg/admission"
-	webhookconfig "k8s.io/apiserver/pkg/admission/plugin/webhook/config"
-	"k8s.io/apiserver/pkg/authorization/authorizer"
-	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	informers "k8s.io/kubernetes/pkg/client/informers/informers_generated/internalversion"
-	"k8s.io/kubernetes/pkg/quota"
+	"k8s.io/apiserver/pkg/admission/initializer"
+	quota "k8s.io/apiserver/pkg/quota/v1"
 )
 
 // TODO add a `WantsToRun` which takes a stopCh.  Might make it generic.
-
-// WantsInternalKubeClientSet defines a function which sets ClientSet for admission plugins that need it
-type WantsInternalKubeClientSet interface {
-	SetInternalKubeClientSet(internalclientset.Interface)
-	admission.InitializationValidator
-}
-
-// WantsInternalKubeInformerFactory defines a function which sets InformerFactory for admission plugins that need it
-type WantsInternalKubeInformerFactory interface {
-	SetInternalKubeInformerFactory(informers.SharedInformerFactory)
-	admission.InitializationValidator
-}
 
 // WantsCloudConfig defines a function which sets CloudConfig for admission plugins that need it.
 type WantsCloudConfig interface {
@@ -51,23 +35,11 @@ type WantsRESTMapper interface {
 	SetRESTMapper(meta.RESTMapper)
 }
 
-// WantsQuotaConfiguration defines a function which sets quota configuration for admission plugins that need it.
-type WantsQuotaConfiguration interface {
-	SetQuotaConfiguration(quota.Configuration)
-	admission.InitializationValidator
-}
-
 // PluginInitializer is used for initialization of the Kubernetes specific admission plugins.
 type PluginInitializer struct {
-	internalClient                    internalclientset.Interface
-	externalClient                    clientset.Interface
-	informers                         informers.SharedInformerFactory
-	authorizer                        authorizer.Authorizer
-	cloudConfig                       []byte
-	restMapper                        meta.RESTMapper
-	quotaConfiguration                quota.Configuration
-	serviceResolver                   webhookconfig.ServiceResolver
-	authenticationInfoResolverWrapper webhookconfig.AuthenticationInfoResolverWrapper
+	cloudConfig        []byte
+	restMapper         meta.RESTMapper
+	quotaConfiguration quota.Configuration
 }
 
 var _ admission.PluginInitializer = &PluginInitializer{}
@@ -76,15 +48,11 @@ var _ admission.PluginInitializer = &PluginInitializer{}
 // TODO: switch these parameters to use the builder pattern or just make them
 // all public, this construction method is pointless boilerplate.
 func NewPluginInitializer(
-	internalClient internalclientset.Interface,
-	sharedInformers informers.SharedInformerFactory,
 	cloudConfig []byte,
 	restMapper meta.RESTMapper,
 	quotaConfiguration quota.Configuration,
 ) *PluginInitializer {
 	return &PluginInitializer{
-		internalClient:     internalClient,
-		informers:          sharedInformers,
 		cloudConfig:        cloudConfig,
 		restMapper:         restMapper,
 		quotaConfiguration: quotaConfiguration,
@@ -94,14 +62,6 @@ func NewPluginInitializer(
 // Initialize checks the initialization interfaces implemented by each plugin
 // and provide the appropriate initialization data
 func (i *PluginInitializer) Initialize(plugin admission.Interface) {
-	if wants, ok := plugin.(WantsInternalKubeClientSet); ok {
-		wants.SetInternalKubeClientSet(i.internalClient)
-	}
-
-	if wants, ok := plugin.(WantsInternalKubeInformerFactory); ok {
-		wants.SetInternalKubeInformerFactory(i.informers)
-	}
-
 	if wants, ok := plugin.(WantsCloudConfig); ok {
 		wants.SetCloudConfig(i.cloudConfig)
 	}
@@ -110,7 +70,7 @@ func (i *PluginInitializer) Initialize(plugin admission.Interface) {
 		wants.SetRESTMapper(i.restMapper)
 	}
 
-	if wants, ok := plugin.(WantsQuotaConfiguration); ok {
+	if wants, ok := plugin.(initializer.WantsQuotaConfiguration); ok {
 		wants.SetQuotaConfiguration(i.quotaConfiguration)
 	}
 }

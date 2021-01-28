@@ -1,3 +1,5 @@
+// +build !dockerless
+
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -19,13 +21,11 @@ package dockershim
 import (
 	"fmt"
 	"strconv"
-	"strings"
 
-	"github.com/blang/semver"
 	dockercontainer "github.com/docker/docker/api/types/container"
 
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
-	knetwork "k8s.io/kubernetes/pkg/kubelet/network"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	knetwork "k8s.io/kubernetes/pkg/kubelet/dockershim/network"
 )
 
 // applySandboxSecurityContext updates docker sandbox options according to security context.
@@ -43,6 +43,7 @@ func applySandboxSecurityContext(lc *runtimeapi.LinuxPodSandboxConfig, config *d
 			ReadonlyRootfs:     lc.SecurityContext.ReadonlyRootfs,
 			SelinuxOptions:     lc.SecurityContext.SelinuxOptions,
 			NamespaceOptions:   lc.SecurityContext.NamespaceOptions,
+			Privileged:         lc.SecurityContext.Privileged,
 		}
 	}
 
@@ -90,7 +91,7 @@ func modifyContainerConfig(sc *runtimeapi.LinuxContainerSecurityContext, config 
 	user := config.User
 	if sc.RunAsGroup != nil {
 		if user == "" {
-			return fmt.Errorf("runAsGroup is specified without a runAsUser.")
+			return fmt.Errorf("runAsGroup is specified without a runAsUser")
 		}
 		user = fmt.Sprintf("%s:%d", config.User, sc.GetRunAsGroup().Value)
 	}
@@ -137,30 +138,34 @@ func modifyHostConfig(sc *runtimeapi.LinuxContainerSecurityContext, hostConfig *
 		hostConfig.SecurityOpt = append(hostConfig.SecurityOpt, "no-new-privileges")
 	}
 
+	if !hostConfig.Privileged {
+		hostConfig.MaskedPaths = sc.MaskedPaths
+		hostConfig.ReadonlyPaths = sc.ReadonlyPaths
+	}
+
 	return nil
 }
 
 // modifySandboxNamespaceOptions apply namespace options for sandbox
 func modifySandboxNamespaceOptions(nsOpts *runtimeapi.NamespaceOption, hostConfig *dockercontainer.HostConfig, network *knetwork.PluginManager) {
 	// The sandbox's PID namespace is the one that's shared, so CONTAINER and POD are equivalent for it
-	modifyCommonNamespaceOptions(nsOpts, hostConfig)
+	if nsOpts.GetPid() == runtimeapi.NamespaceMode_NODE {
+		hostConfig.PidMode = namespaceModeHost
+	}
 	modifyHostOptionsForSandbox(nsOpts, network, hostConfig)
 }
 
 // modifyContainerNamespaceOptions apply namespace options for container
 func modifyContainerNamespaceOptions(nsOpts *runtimeapi.NamespaceOption, podSandboxID string, hostConfig *dockercontainer.HostConfig) {
-	if nsOpts.GetPid() == runtimeapi.NamespaceMode_POD {
-		hostConfig.PidMode = dockercontainer.PidMode(fmt.Sprintf("container:%v", podSandboxID))
-	}
-	modifyCommonNamespaceOptions(nsOpts, hostConfig)
-	modifyHostOptionsForContainer(nsOpts, podSandboxID, hostConfig)
-}
-
-// modifyCommonNamespaceOptions apply common namespace options for sandbox and container
-func modifyCommonNamespaceOptions(nsOpts *runtimeapi.NamespaceOption, hostConfig *dockercontainer.HostConfig) {
-	if nsOpts.GetPid() == runtimeapi.NamespaceMode_NODE {
+	switch nsOpts.GetPid() {
+	case runtimeapi.NamespaceMode_NODE:
 		hostConfig.PidMode = namespaceModeHost
+	case runtimeapi.NamespaceMode_POD:
+		hostConfig.PidMode = dockercontainer.PidMode(fmt.Sprintf("container:%v", podSandboxID))
+	case runtimeapi.NamespaceMode_TARGET:
+		hostConfig.PidMode = dockercontainer.PidMode(fmt.Sprintf("container:%v", nsOpts.GetTargetId()))
 	}
+	modifyHostOptionsForContainer(nsOpts, podSandboxID, hostConfig)
 }
 
 // modifyHostOptionsForSandbox applies NetworkMode/UTSMode to sandbox's dockercontainer.HostConfig.
@@ -197,23 +202,5 @@ func modifyHostOptionsForContainer(nsOpts *runtimeapi.NamespaceOption, podSandbo
 
 	if nsOpts.GetNetwork() == runtimeapi.NamespaceMode_NODE {
 		hc.UTSMode = namespaceModeHost
-	}
-}
-
-// modifyPIDNamespaceOverrides implements two temporary overrides for the default PID namespace sharing for Docker:
-//     1. Docker engine prior to API Version 1.24 doesn't support attaching to another container's
-//        PID namespace, and it didn't stabilize until 1.26. This check can be removed when Kubernetes'
-//        minimum Docker version is at least 1.13.1 (API version 1.26).
-//     2. The administrator can override the API behavior by using the deprecated --docker-disable-shared-pid=false
-//        flag. Until this flag is removed, this causes pods to use NamespaceMode_POD instead of
-//        NamespaceMode_CONTAINER regardless of pod configuration.
-// TODO(verb): remove entirely once these two conditions are satisfied
-func modifyContainerPIDNamespaceOverrides(disableSharedPID bool, version *semver.Version, hc *dockercontainer.HostConfig, podSandboxID string) {
-	if version.LT(semver.Version{Major: 1, Minor: 26}) {
-		if strings.HasPrefix(string(hc.PidMode), "container:") {
-			hc.PidMode = ""
-		}
-	} else if !disableSharedPID && hc.PidMode == "" {
-		hc.PidMode = dockercontainer.PidMode(fmt.Sprintf("container:%v", podSandboxID))
 	}
 }

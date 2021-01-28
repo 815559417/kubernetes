@@ -1,10 +1,26 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
 package errdefs
 
 import (
+	"context"
 	"strings"
 
 	"github.com/pkg/errors"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -40,6 +56,10 @@ func ToGRPC(err error) error {
 		return status.Errorf(codes.Unavailable, err.Error())
 	case IsNotImplemented(err):
 		return status.Errorf(codes.Unimplemented, err.Error())
+	case IsCanceled(err):
+		return status.Errorf(codes.Canceled, err.Error())
+	case IsDeadlineExceeded(err):
+		return status.Errorf(codes.DeadlineExceeded, err.Error())
 	}
 
 	return err
@@ -61,7 +81,7 @@ func FromGRPC(err error) error {
 
 	var cls error // divide these into error classes, becomes the cause
 
-	switch grpc.Code(err) {
+	switch code(err) {
 	case codes.InvalidArgument:
 		cls = ErrInvalidArgument
 	case codes.AlreadyExists:
@@ -74,13 +94,17 @@ func FromGRPC(err error) error {
 		cls = ErrFailedPrecondition
 	case codes.Unimplemented:
 		cls = ErrNotImplemented
+	case codes.Canceled:
+		cls = context.Canceled
+	case codes.DeadlineExceeded:
+		cls = context.DeadlineExceeded
 	default:
 		cls = ErrUnknown
 	}
 
 	msg := rebaseMessage(cls, err)
 	if msg != "" {
-		err = errors.Wrapf(cls, msg)
+		err = errors.Wrap(cls, msg)
 	} else {
 		err = errors.WithStack(cls)
 	}
@@ -94,7 +118,7 @@ func FromGRPC(err error) error {
 // Effectively, we just remove the string of cls from the end of err if it
 // appears there.
 func rebaseMessage(cls error, err error) string {
-	desc := grpc.ErrorDesc(err)
+	desc := errDesc(err)
 	clss := cls.Error()
 	if desc == clss {
 		return ""
@@ -106,4 +130,18 @@ func rebaseMessage(cls error, err error) string {
 func isGRPCError(err error) bool {
 	_, ok := status.FromError(err)
 	return ok
+}
+
+func code(err error) codes.Code {
+	if s, ok := status.FromError(err); ok {
+		return s.Code()
+	}
+	return codes.Unknown
+}
+
+func errDesc(err error) string {
+	if s, ok := status.FromError(err); ok {
+		return s.Message()
+	}
+	return err.Error()
 }

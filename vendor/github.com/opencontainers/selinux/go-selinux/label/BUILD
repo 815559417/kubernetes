@@ -2,44 +2,25 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
-    srcs = select({
+    srcs = [
+        "label.go",
+        "label_selinux.go",
+        "label_stub.go",
+    ],
+    importmap = "k8s.io/kubernetes/vendor/github.com/opencontainers/selinux/go-selinux/label",
+    importpath = "github.com/opencontainers/selinux/go-selinux/label",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//vendor/github.com/opencontainers/selinux/go-selinux:go_default_library",
+    ] + select({
         "@io_bazel_rules_go//go/platform:android": [
-            "label.go",
-        ],
-        "@io_bazel_rules_go//go/platform:darwin": [
-            "label.go",
-        ],
-        "@io_bazel_rules_go//go/platform:dragonfly": [
-            "label.go",
-        ],
-        "@io_bazel_rules_go//go/platform:freebsd": [
-            "label.go",
+            "//vendor/github.com/pkg/errors:go_default_library",
         ],
         "@io_bazel_rules_go//go/platform:linux": [
-            "label.go",
-        ],
-        "@io_bazel_rules_go//go/platform:nacl": [
-            "label.go",
-        ],
-        "@io_bazel_rules_go//go/platform:netbsd": [
-            "label.go",
-        ],
-        "@io_bazel_rules_go//go/platform:openbsd": [
-            "label.go",
-        ],
-        "@io_bazel_rules_go//go/platform:plan9": [
-            "label.go",
-        ],
-        "@io_bazel_rules_go//go/platform:solaris": [
-            "label.go",
-        ],
-        "@io_bazel_rules_go//go/platform:windows": [
-            "label.go",
+            "//vendor/github.com/pkg/errors:go_default_library",
         ],
         "//conditions:default": [],
     }),
-    importpath = "github.com/opencontainers/selinux/go-selinux/label",
-    visibility = ["//visibility:public"],
 )
 
 filegroup(

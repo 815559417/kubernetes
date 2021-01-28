@@ -1,4 +1,4 @@
-// +build linux
+// +build linux,!dockerless
 
 /*
 Copyright 2015 The Kubernetes Authors.
@@ -30,9 +30,11 @@ import (
 	"github.com/blang/semver"
 	dockertypes "github.com/docker/docker/api/types"
 	dockercontainer "github.com/docker/docker/api/types/container"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	v1 "k8s.io/api/core/v1"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
+// DefaultMemorySwap always returns 0 for no memory swap in a sandbox
 func DefaultMemorySwap() int64 {
 	return 0
 }
@@ -47,23 +49,29 @@ func (ds *dockerService) getSecurityOpts(seccompProfile string, separator rune) 
 	return seccompSecurityOpts, nil
 }
 
+func (ds *dockerService) getSandBoxSecurityOpts(separator rune) []string {
+	// run sandbox with no-new-privileges and using runtime/default
+	// sending no "seccomp=" means docker will use default profile
+	return []string{"no-new-privileges"}
+}
+
 func getSeccompDockerOpts(seccompProfile string) ([]dockerOpt, error) {
-	if seccompProfile == "" || seccompProfile == "unconfined" {
+	if seccompProfile == "" || seccompProfile == v1.SeccompProfileNameUnconfined {
 		// return early the default
 		return defaultSeccompOpt, nil
 	}
 
-	if seccompProfile == "docker/default" {
+	if seccompProfile == v1.SeccompProfileRuntimeDefault || seccompProfile == v1.DeprecatedSeccompProfileDockerDefault {
 		// return nil so docker will load the default seccomp profile
 		return nil, nil
 	}
 
-	if !strings.HasPrefix(seccompProfile, "localhost/") {
+	if !strings.HasPrefix(seccompProfile, v1.SeccompLocalhostProfileNamePrefix) {
 		return nil, fmt.Errorf("unknown seccomp profile option: %s", seccompProfile)
 	}
 
 	// get the full path of seccomp profile when prefixed with 'localhost/'.
-	fname := strings.TrimPrefix(seccompProfile, "localhost/")
+	fname := strings.TrimPrefix(seccompProfile, v1.SeccompLocalhostProfileNamePrefix)
 	if !filepath.IsAbs(fname) {
 		return nil, fmt.Errorf("seccomp profile path must be absolute, but got relative path %q", fname)
 	}
@@ -110,6 +118,7 @@ func (ds *dockerService) updateCreateConfig(
 				CPUShares:  rOpts.CpuShares,
 				CPUQuota:   rOpts.CpuQuota,
 				CPUPeriod:  rOpts.CpuPeriod,
+				CpusetCpus: rOpts.CpusetCpus,
 			}
 			createConfig.HostConfig.OomScoreAdj = int(rOpts.OomScoreAdj)
 		}
@@ -119,7 +128,6 @@ func (ds *dockerService) updateCreateConfig(
 		if err := applyContainerSecurityContext(lc, podSandboxID, createConfig.Config, createConfig.HostConfig, securityOptSep); err != nil {
 			return fmt.Errorf("failed to apply container security context for container %q: %v", config.Metadata.Name, err)
 		}
-		modifyContainerPIDNamespaceOverrides(ds.disableSharedPID, apiVersion, createConfig.HostConfig, podSandboxID)
 	}
 
 	// Apply cgroupsParent derived from the sandbox config.
@@ -135,8 +143,8 @@ func (ds *dockerService) updateCreateConfig(
 	return nil
 }
 
-func (ds *dockerService) determinePodIPBySandboxID(uid string) string {
-	return ""
+func (ds *dockerService) determinePodIPBySandboxID(uid string) []string {
+	return nil
 }
 
 func getNetworkNamespace(c *dockertypes.ContainerJSON) (string, error) {

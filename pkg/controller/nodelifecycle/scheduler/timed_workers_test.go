@@ -47,7 +47,7 @@ func TestExecute(t *testing.T) {
 	wg.Wait()
 	lastVal := atomic.LoadInt32(&testVal)
 	if lastVal != 5 {
-		t.Errorf("Espected testVal = 5, got %v", lastVal)
+		t.Errorf("Expected testVal = 5, got %v", lastVal)
 	}
 }
 
@@ -61,7 +61,7 @@ func TestExecuteDelayed(t *testing.T) {
 		return nil
 	})
 	now := time.Now()
-	then := now.Add(3 * time.Second)
+	then := now.Add(10 * time.Second)
 	queue.AddWork(NewWorkArgs("1", "1"), now, then)
 	queue.AddWork(NewWorkArgs("2", "2"), now, then)
 	queue.AddWork(NewWorkArgs("3", "3"), now, then)
@@ -75,7 +75,7 @@ func TestExecuteDelayed(t *testing.T) {
 	wg.Wait()
 	lastVal := atomic.LoadInt32(&testVal)
 	if lastVal != 5 {
-		t.Errorf("Espected testVal = 5, got %v", lastVal)
+		t.Errorf("Expected testVal = 5, got %v", lastVal)
 	}
 }
 
@@ -89,7 +89,7 @@ func TestCancel(t *testing.T) {
 		return nil
 	})
 	now := time.Now()
-	then := now.Add(3 * time.Second)
+	then := now.Add(10 * time.Second)
 	queue.AddWork(NewWorkArgs("1", "1"), now, then)
 	queue.AddWork(NewWorkArgs("2", "2"), now, then)
 	queue.AddWork(NewWorkArgs("3", "3"), now, then)
@@ -105,7 +105,7 @@ func TestCancel(t *testing.T) {
 	wg.Wait()
 	lastVal := atomic.LoadInt32(&testVal)
 	if lastVal != 3 {
-		t.Errorf("Espected testVal = 3, got %v", lastVal)
+		t.Errorf("Expected testVal = 3, got %v", lastVal)
 	}
 }
 
@@ -119,7 +119,7 @@ func TestCancelAndReadd(t *testing.T) {
 		return nil
 	})
 	now := time.Now()
-	then := now.Add(3 * time.Second)
+	then := now.Add(10 * time.Second)
 	queue.AddWork(NewWorkArgs("1", "1"), now, then)
 	queue.AddWork(NewWorkArgs("2", "2"), now, then)
 	queue.AddWork(NewWorkArgs("3", "3"), now, then)
@@ -136,6 +136,6 @@ func TestCancelAndReadd(t *testing.T) {
 	wg.Wait()
 	lastVal := atomic.LoadInt32(&testVal)
 	if lastVal != 4 {
-		t.Errorf("Espected testVal = 4, got %v", lastVal)
+		t.Errorf("Expected testVal = 4, got %v", lastVal)
 	}
 }

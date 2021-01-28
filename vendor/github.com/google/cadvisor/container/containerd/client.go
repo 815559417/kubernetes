@@ -16,6 +16,8 @@ package containerd
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -23,15 +25,11 @@ import (
 	tasksapi "github.com/containerd/containerd/api/services/tasks/v1"
 	versionapi "github.com/containerd/containerd/api/services/version/v1"
 	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/dialer"
 	"github.com/containerd/containerd/errdefs"
-	pempty "github.com/golang/protobuf/ptypes/empty"
+	"github.com/containerd/containerd/pkg/dialer"
+	ptypes "github.com/gogo/protobuf/types"
 	"google.golang.org/grpc"
-)
-
-const (
-	// k8sNamespace is the namespace we use to connect containerd.
-	k8sNamespace = "k8s.io"
+	"google.golang.org/grpc/backoff"
 )
 
 type client struct {
@@ -40,33 +38,52 @@ type client struct {
 	versionService   versionapi.VersionClient
 }
 
-type containerdClient interface {
+type ContainerdClient interface {
 	LoadContainer(ctx context.Context, id string) (*containers.Container, error)
 	TaskPid(ctx context.Context, id string) (uint32, error)
 	Version(ctx context.Context) (string, error)
 }
 
 var once sync.Once
-var ctrdClient containerdClient = nil
+var ctrdClient ContainerdClient = nil
+
+const (
+	maxBackoffDelay   = 3 * time.Second
+	baseBackoffDelay  = 100 * time.Millisecond
+	connectionTimeout = 2 * time.Second
+)
 
 // Client creates a containerd client
-func Client() (containerdClient, error) {
+func Client(address, namespace string) (ContainerdClient, error) {
 	var retErr error
 	once.Do(func() {
+		tryConn, err := net.DialTimeout("unix", address, connectionTimeout)
+		if err != nil {
+			retErr = fmt.Errorf("containerd: cannot unix dial containerd api service: %v", err)
+			return
+		}
+		tryConn.Close()
+
+		connParams := grpc.ConnectParams{
+			Backoff: backoff.DefaultConfig,
+		}
+		connParams.Backoff.BaseDelay = baseBackoffDelay
+		connParams.Backoff.MaxDelay = maxBackoffDelay
 		gopts := []grpc.DialOption{
 			grpc.WithInsecure(),
-			grpc.WithDialer(dialer.Dialer),
+			grpc.WithContextDialer(dialer.ContextDialer),
 			grpc.WithBlock(),
-			grpc.WithTimeout(2 * time.Second),
-			grpc.WithBackoffMaxDelay(3 * time.Second),
+			grpc.WithConnectParams(connParams),
 		}
-		unary, stream := newNSInterceptors(k8sNamespace)
+		unary, stream := newNSInterceptors(namespace)
 		gopts = append(gopts,
 			grpc.WithUnaryInterceptor(unary),
 			grpc.WithStreamInterceptor(stream),
 		)
 
-		conn, err := grpc.Dial(dialer.DialAddress("/var/run/containerd/containerd.sock"), gopts...)
+		ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
+		defer cancel()
+		conn, err := grpc.DialContext(ctx, dialer.DialAddress(address), gopts...)
 		if err != nil {
 			retErr = err
 			return
@@ -101,7 +118,7 @@ func (c *client) TaskPid(ctx context.Context, id string) (uint32, error) {
 }
 
 func (c *client) Version(ctx context.Context) (string, error) {
-	response, err := c.versionService.Version(ctx, &pempty.Empty{})
+	response, err := c.versionService.Version(ctx, &ptypes.Empty{})
 	if err != nil {
 		return "", errdefs.FromGRPC(err)
 	}

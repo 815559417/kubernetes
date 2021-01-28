@@ -16,19 +16,22 @@ go_library(
     deps = [
         "//pkg/apis/core:go_default_library",
         "//pkg/registry/core/service/allocator:go_default_library",
-        "//vendor/github.com/golang/glog:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/util/net:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/util/net:go_default_library",
+        "//vendor/k8s.io/klog/v2:go_default_library",
     ],
 )
 
 go_test(
     name = "go_default_test",
-    srcs = ["allocator_test.go"],
+    srcs = [
+        "allocator_test.go",
+        "operation_test.go",
+    ],
     embed = [":go_default_library"],
     deps = [
         "//pkg/apis/core:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/util/net:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/util/sets:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/util/net:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/util/sets:go_default_library",
     ],
 )
 
@@ -44,6 +47,7 @@ filegroup(
     srcs = [
         ":package-srcs",
         "//pkg/registry/core/service/portallocator/controller:all-srcs",
+        "//pkg/registry/core/service/portallocator/storage:all-srcs",
     ],
     tags = ["automanaged"],
 )

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2015 The Kubernetes Authors.
 #
@@ -13,6 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# This script grabs profiles from running components.
+# Usage: `hack/grab-profiles.sh`.
 
 set -o errexit
 set -o nounset
@@ -47,7 +50,7 @@ function grab_profiles_from_component {
   done
 }
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
 server_addr=""
@@ -65,7 +68,7 @@ output_dir="."
 tunnel_port="${tunnel_port:-1234}"
 
 args=$(getopt -o s:mho:k:c -l server:,master,heapster,output:,kubelet:,scheduler,controller-manager,help,inuse-space,inuse-objects,alloc-space,alloc-objects,cpu,kubelet-binary:,master-binary:,scheduler-binary:,controller-manager-binary:,scheduler-port:,controller-manager-port: -- "$@")
-if [[ $? -ne 0 ]]; then
+if [[ $? ]]; then
   >&2 echo "Error in getopt"
   exit 1
 fi

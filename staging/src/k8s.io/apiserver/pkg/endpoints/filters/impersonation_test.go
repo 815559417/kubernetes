@@ -17,6 +17,7 @@ limitations under the License.
 package filters
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -35,7 +36,7 @@ import (
 
 type impersonateAuthorizer struct{}
 
-func (impersonateAuthorizer) Authorize(a authorizer.Attributes) (authorized authorizer.Decision, reason string, err error) {
+func (impersonateAuthorizer) Authorize(ctx context.Context, a authorizer.Attributes) (authorized authorizer.Decision, reason string, err error) {
 	user := a.GetUser()
 
 	switch {
@@ -66,6 +67,10 @@ func (impersonateAuthorizer) Authorize(a authorizer.Attributes) (authorized auth
 	}
 
 	if len(user.GetGroups()) > 1 && user.GetGroups()[1] == "extra-setter-scopes" && a.GetVerb() == "impersonate" && a.GetResource() == "userextras" && a.GetSubresource() == "scopes" {
+		return authorizer.DecisionAllow, "", nil
+	}
+
+	if len(user.GetGroups()) > 1 && (user.GetGroups()[1] == "escaped-scopes" || user.GetGroups()[1] == "almost-escaped-scopes") {
 		return authorizer.DecisionAllow, "", nil
 	}
 
@@ -158,7 +163,7 @@ func TestImpersonationFilter(t *testing.T) {
 			impersonationGroups: []string{"some-group"},
 			expectedUser: &user.DefaultInfo{
 				Name:   "system:admin",
-				Groups: []string{"some-group"},
+				Groups: []string{"some-group", "system:authenticated"},
 				Extra:  map[string][]string{},
 			},
 			expectedCode: http.StatusOK,
@@ -224,6 +229,36 @@ func TestImpersonationFilter(t *testing.T) {
 			expectedCode: http.StatusOK,
 		},
 		{
+			name: "percent-escaped-userextras",
+			user: &user.DefaultInfo{
+				Name:   "dev",
+				Groups: []string{"wheel", "escaped-scopes"},
+			},
+			impersonationUser:       "system:admin",
+			impersonationUserExtras: map[string][]string{"example.com%2fescaped%e1%9b%84scopes": {"scope-a", "scope-b"}},
+			expectedUser: &user.DefaultInfo{
+				Name:   "system:admin",
+				Groups: []string{"system:authenticated"},
+				Extra:  map[string][]string{"example.com/escapedᛄscopes": {"scope-a", "scope-b"}},
+			},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name: "almost-percent-escaped-userextras",
+			user: &user.DefaultInfo{
+				Name:   "dev",
+				Groups: []string{"wheel", "almost-escaped-scopes"},
+			},
+			impersonationUser:       "system:admin",
+			impersonationUserExtras: map[string][]string{"almost%zzpercent%xxencoded": {"scope-a", "scope-b"}},
+			expectedUser: &user.DefaultInfo{
+				Name:   "system:admin",
+				Groups: []string{"system:authenticated"},
+				Extra:  map[string][]string{"almost%zzpercent%xxencoded": {"scope-a", "scope-b"}},
+			},
+			expectedCode: http.StatusOK,
+		},
+		{
 			name: "allowed-users-impersonation",
 			user: &user.DefaultInfo{
 				Name:   "dev",
@@ -273,7 +308,7 @@ func TestImpersonationFilter(t *testing.T) {
 			impersonationUser: "system:anonymous",
 			expectedUser: &user.DefaultInfo{
 				Name:   "system:anonymous",
-				Groups: []string{},
+				Groups: []string{"system:unauthenticated"},
 				Extra:  map[string][]string{},
 			},
 			expectedCode: http.StatusOK,
@@ -306,15 +341,56 @@ func TestImpersonationFilter(t *testing.T) {
 			},
 			expectedCode: http.StatusOK,
 		},
+		{
+			name: "specified-authenticated-group-prevents-double-adding-authenticated-group",
+			user: &user.DefaultInfo{
+				Name:   "dev",
+				Groups: []string{"wheel", "group-impersonater"},
+			},
+			impersonationUser:   "system:admin",
+			impersonationGroups: []string{"some-group", "system:authenticated"},
+			expectedUser: &user.DefaultInfo{
+				Name:   "system:admin",
+				Groups: []string{"some-group", "system:authenticated"},
+				Extra:  map[string][]string{},
+			},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name: "anonymous-user-should-include-unauthenticated-group",
+			user: &user.DefaultInfo{
+				Name: "system:admin",
+			},
+			impersonationUser: "system:anonymous",
+			expectedUser: &user.DefaultInfo{
+				Name:   "system:anonymous",
+				Groups: []string{"system:unauthenticated"},
+				Extra:  map[string][]string{},
+			},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name: "anonymous-user-prevents-double-adding-unauthenticated-group",
+			user: &user.DefaultInfo{
+				Name: "system:admin",
+			},
+			impersonationUser:   "system:anonymous",
+			impersonationGroups: []string{"system:unauthenticated"},
+			expectedUser: &user.DefaultInfo{
+				Name:   "system:anonymous",
+				Groups: []string{"system:unauthenticated"},
+				Extra:  map[string][]string{},
+			},
+			expectedCode: http.StatusOK,
+		},
 	}
 
-	requestContextMapper := request.NewRequestContextMapper()
-	var ctx request.Context
+	var ctx context.Context
 	var actualUser user.Info
 	var lock sync.Mutex
 
 	doNothingHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		currentCtx, _ := requestContextMapper.Get(req)
+		currentCtx := req.Context()
 		user, exists := request.UserFrom(currentCtx)
 		if !exists {
 			actualUser = nil
@@ -345,8 +421,8 @@ func TestImpersonationFilter(t *testing.T) {
 			}()
 			lock.Lock()
 			defer lock.Unlock()
-			requestContextMapper.Update(req, ctx)
-			currentCtx, _ := requestContextMapper.Get(req)
+			req = req.WithContext(ctx)
+			currentCtx := req.Context()
 
 			user, exists := request.UserFrom(currentCtx)
 			if !exists {
@@ -358,49 +434,50 @@ func TestImpersonationFilter(t *testing.T) {
 
 			delegate.ServeHTTP(w, req)
 		})
-	}(WithImpersonation(doNothingHandler, requestContextMapper, impersonateAuthorizer{}, serializer.NewCodecFactory(runtime.NewScheme())))
-	handler = request.WithRequestContext(handler, requestContextMapper)
+	}(WithImpersonation(doNothingHandler, impersonateAuthorizer{}, serializer.NewCodecFactory(runtime.NewScheme())))
 
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
 	for _, tc := range testCases {
-		func() {
-			lock.Lock()
-			defer lock.Unlock()
-			ctx = request.WithUser(request.NewContext(), tc.user)
-		}()
+		t.Run(tc.name, func(t *testing.T) {
+			func() {
+				lock.Lock()
+				defer lock.Unlock()
+				ctx = request.WithUser(request.NewContext(), tc.user)
+			}()
 
-		req, err := http.NewRequest("GET", server.URL, nil)
-		if err != nil {
-			t.Errorf("%s: unexpected error: %v", tc.name, err)
-			continue
-		}
-		if len(tc.impersonationUser) > 0 {
-			req.Header.Add(authenticationapi.ImpersonateUserHeader, tc.impersonationUser)
-		}
-		for _, group := range tc.impersonationGroups {
-			req.Header.Add(authenticationapi.ImpersonateGroupHeader, group)
-		}
-		for extraKey, values := range tc.impersonationUserExtras {
-			for _, value := range values {
-				req.Header.Add(authenticationapi.ImpersonateUserExtraHeaderPrefix+extraKey, value)
+			req, err := http.NewRequest("GET", server.URL, nil)
+			if err != nil {
+				t.Errorf("%s: unexpected error: %v", tc.name, err)
+				return
 			}
-		}
+			if len(tc.impersonationUser) > 0 {
+				req.Header.Add(authenticationapi.ImpersonateUserHeader, tc.impersonationUser)
+			}
+			for _, group := range tc.impersonationGroups {
+				req.Header.Add(authenticationapi.ImpersonateGroupHeader, group)
+			}
+			for extraKey, values := range tc.impersonationUserExtras {
+				for _, value := range values {
+					req.Header.Add(authenticationapi.ImpersonateUserExtraHeaderPrefix+extraKey, value)
+				}
+			}
 
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Errorf("%s: unexpected error: %v", tc.name, err)
-			continue
-		}
-		if resp.StatusCode != tc.expectedCode {
-			t.Errorf("%s: expected %v, actual %v", tc.name, tc.expectedCode, resp.StatusCode)
-			continue
-		}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Errorf("%s: unexpected error: %v", tc.name, err)
+				return
+			}
+			if resp.StatusCode != tc.expectedCode {
+				t.Errorf("%s: expected %v, actual %v", tc.name, tc.expectedCode, resp.StatusCode)
+				return
+			}
 
-		if !reflect.DeepEqual(actualUser, tc.expectedUser) {
-			t.Errorf("%s: expected %#v, actual %#v", tc.name, tc.expectedUser, actualUser)
-			continue
-		}
+			if !reflect.DeepEqual(actualUser, tc.expectedUser) {
+				t.Errorf("%s: expected %#v, actual %#v", tc.name, tc.expectedUser, actualUser)
+				return
+			}
+		})
 	}
 }

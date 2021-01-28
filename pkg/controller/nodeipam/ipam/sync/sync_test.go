@@ -24,8 +24,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/glog"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller/nodeipam/ipam/cidrset"
 	"k8s.io/kubernetes/pkg/controller/nodeipam/ipam/test"
 
@@ -58,13 +58,13 @@ type fakeAPIs struct {
 	results []error
 }
 
-func (f *fakeAPIs) Alias(ctx context.Context, nodeName string) (*net.IPNet, error) {
-	f.calls = append(f.calls, fmt.Sprintf("alias %v", nodeName))
+func (f *fakeAPIs) Alias(ctx context.Context, node *v1.Node) (*net.IPNet, error) {
+	f.calls = append(f.calls, fmt.Sprintf("alias %v", node.Name))
 	return f.aliasRange, f.aliasErr
 }
 
-func (f *fakeAPIs) AddAlias(ctx context.Context, nodeName string, cidrRange *net.IPNet) error {
-	f.calls = append(f.calls, fmt.Sprintf("addAlias %v %v", nodeName, cidrRange))
+func (f *fakeAPIs) AddAlias(ctx context.Context, node *v1.Node, cidrRange *net.IPNet) error {
+	f.calls = append(f.calls, fmt.Sprintf("addAlias %v %v", node.Name, cidrRange))
 	return f.addAliasErr
 }
 
@@ -88,7 +88,7 @@ func (f *fakeAPIs) EmitNodeWarningEvent(nodeName, reason, fmtStr string, args ..
 }
 
 func (f *fakeAPIs) ReportResult(err error) {
-	glog.V(2).Infof("ReportResult %v", err)
+	klog.V(2).Infof("ReportResult %v", err)
 	f.results = append(f.results, err)
 	if f.reportChan != nil {
 		f.reportChan <- struct{}{}
@@ -104,7 +104,7 @@ func (f *fakeAPIs) ResyncTimeout() time.Duration {
 
 func (f *fakeAPIs) dumpTrace() {
 	for i, x := range f.calls {
-		glog.Infof("trace %v: %v", i, x)
+		klog.Infof("trace %v: %v", i, x)
 	}
 }
 

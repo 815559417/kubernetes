@@ -19,11 +19,12 @@ package cpuset
 import (
 	"bytes"
 	"fmt"
-	"github.com/golang/glog"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+
+	"k8s.io/klog/v2"
 )
 
 // Builder is a mutable builder for CPUSet. Functions that mutate instances
@@ -147,6 +148,22 @@ func (s CPUSet) Union(s2 CPUSet) CPUSet {
 	return b.Result()
 }
 
+// UnionAll returns a new CPU set that contains all of the elements from this
+// set and all of the elements from the supplied sets, without mutating
+// either source set.
+func (s CPUSet) UnionAll(s2 []CPUSet) CPUSet {
+	b := NewBuilder()
+	for cpu := range s.elems {
+		b.Add(cpu)
+	}
+	for _, cs := range s2 {
+		for cpu := range cs.elems {
+			b.Add(cpu)
+		}
+	}
+	return b.Result()
+}
+
 // Intersection returns a new CPU set that contains all of the elements
 // that are present in both this set and the supplied set, without mutating
 // either source set.
@@ -169,6 +186,37 @@ func (s CPUSet) ToSlice() []int {
 		result = append(result, cpu)
 	}
 	sort.Ints(result)
+	return result
+}
+
+// ToSliceNoSort returns a slice of integers that contains all elements from
+// this set.
+func (s CPUSet) ToSliceNoSort() []int {
+	result := []int{}
+	for cpu := range s.elems {
+		result = append(result, cpu)
+	}
+	return result
+}
+
+// ToSliceInt64 returns an ordered slice of int64 that contains all elements from
+// this set
+func (s CPUSet) ToSliceInt64() []int64 {
+	var result []int64
+	for cpu := range s.elems {
+		result = append(result, int64(cpu))
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+// ToSliceNoSortInt64 returns a slice of int64 that contains all elements from
+// this set.
+func (s CPUSet) ToSliceNoSortInt64() []int64 {
+	var result []int64
+	for cpu := range s.elems {
+		result = append(result, int64(cpu))
+	}
 	return result
 }
 
@@ -221,7 +269,7 @@ func (s CPUSet) String() string {
 func MustParse(s string) CPUSet {
 	res, err := Parse(s)
 	if err != nil {
-		glog.Fatalf("unable to parse [%s] as CPUSet: %v", s, err)
+		klog.Fatalf("unable to parse [%s] as CPUSet: %v", s, err)
 	}
 	return res
 }

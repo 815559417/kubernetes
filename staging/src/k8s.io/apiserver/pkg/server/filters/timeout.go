@@ -18,49 +18,53 @@ package filters
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/endpoints/metrics"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 )
 
-var errConnKilled = fmt.Errorf("killing connection/stream because serving request timed out and response had been started")
-
 // WithTimeoutForNonLongRunningRequests times out non-long-running requests after the time given by timeout.
-func WithTimeoutForNonLongRunningRequests(handler http.Handler, requestContextMapper apirequest.RequestContextMapper, longRunning apirequest.LongRunningRequestCheck, timeout time.Duration) http.Handler {
+func WithTimeoutForNonLongRunningRequests(handler http.Handler, longRunning apirequest.LongRunningRequestCheck, timeout time.Duration) http.Handler {
 	if longRunning == nil {
 		return handler
 	}
-	timeoutFunc := func(req *http.Request) (<-chan time.Time, func(), *apierrors.StatusError) {
+	timeoutFunc := func(req *http.Request) (*http.Request, <-chan time.Time, func(), *apierrors.StatusError) {
 		// TODO unify this with apiserver.MaxInFlightLimit
-		ctx, ok := requestContextMapper.Get(req)
-		if !ok {
-			// if this happens, the handler chain isn't setup correctly because there is no context mapper
-			return time.After(timeout), func() {}, apierrors.NewInternalError(fmt.Errorf("no context found for request during timeout"))
-		}
+		ctx := req.Context()
 
 		requestInfo, ok := apirequest.RequestInfoFrom(ctx)
 		if !ok {
 			// if this happens, the handler chain isn't setup correctly because there is no request info
-			return time.After(timeout), func() {}, apierrors.NewInternalError(fmt.Errorf("no request info found for request during timeout"))
+			return req, time.After(timeout), func() {}, apierrors.NewInternalError(fmt.Errorf("no request info found for request during timeout"))
 		}
 
 		if longRunning(req, requestInfo) {
-			return nil, nil, nil
+			return req, nil, nil, nil
 		}
-		metricFn := func() {
-			metrics.Record(req, requestInfo, "", http.StatusGatewayTimeout, 0, 0)
+
+		ctx, cancel := context.WithCancel(ctx)
+		req = req.WithContext(ctx)
+
+		postTimeoutFn := func() {
+			cancel()
+			metrics.RecordRequestTermination(req, requestInfo, metrics.APIServerComponent, http.StatusGatewayTimeout)
 		}
-		return time.After(timeout), metricFn, apierrors.NewTimeoutError(fmt.Sprintf("request did not complete within %s", timeout), 0)
+		return req, time.After(timeout), postTimeoutFn, apierrors.NewTimeoutError(fmt.Sprintf("request did not complete within %s", timeout), 0)
 	}
 	return WithTimeout(handler, timeoutFunc)
 }
+
+type timeoutFunc = func(*http.Request) (req *http.Request, timeout <-chan time.Time, postTimeoutFunc func(), err *apierrors.StatusError)
 
 // WithTimeout returns an http.Handler that runs h with a timeout
 // determined by timeoutFunc. The new http.Handler calls h.ServeHTTP to handle
@@ -71,33 +75,67 @@ func WithTimeoutForNonLongRunningRequests(handler http.Handler, requestContextMa
 // http.ErrHandlerTimeout. If timeoutFunc returns a nil timeout channel, no
 // timeout will be enforced. recordFn is a function that will be invoked whenever
 // a timeout happens.
-func WithTimeout(h http.Handler, timeoutFunc func(*http.Request) (timeout <-chan time.Time, recordFn func(), err *apierrors.StatusError)) http.Handler {
+func WithTimeout(h http.Handler, timeoutFunc timeoutFunc) http.Handler {
 	return &timeoutHandler{h, timeoutFunc}
 }
 
 type timeoutHandler struct {
 	handler http.Handler
-	timeout func(*http.Request) (<-chan time.Time, func(), *apierrors.StatusError)
+	timeout timeoutFunc
 }
 
 func (t *timeoutHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	after, recordFn, err := t.timeout(r)
+	r, after, postTimeoutFn, err := t.timeout(r)
 	if after == nil {
 		t.handler.ServeHTTP(w, r)
 		return
 	}
 
-	done := make(chan struct{})
+	// resultCh is used as both errCh and stopCh
+	resultCh := make(chan interface{})
 	tw := newTimeoutWriter(w)
 	go func() {
+		defer func() {
+			err := recover()
+			// do not wrap the sentinel ErrAbortHandler panic value
+			if err != nil && err != http.ErrAbortHandler {
+				// Same as stdlib http server code. Manually allocate stack
+				// trace buffer size to prevent excessively large logs
+				const size = 64 << 10
+				buf := make([]byte, size)
+				buf = buf[:runtime.Stack(buf, false)]
+				err = fmt.Sprintf("%v\n%s", err, buf)
+			}
+			resultCh <- err
+		}()
 		t.handler.ServeHTTP(tw, r)
-		close(done)
 	}()
 	select {
-	case <-done:
+	case err := <-resultCh:
+		// panic if error occurs; stop otherwise
+		if err != nil {
+			panic(err)
+		}
 		return
 	case <-after:
-		recordFn()
+		defer func() {
+			// resultCh needs to have a reader, since the function doing
+			// the work needs to send to it. This is defer'd to ensure it runs
+			// ever if the post timeout work itself panics.
+			go func() {
+				res := <-resultCh
+				if res != nil {
+					switch t := res.(type) {
+					case error:
+						utilruntime.HandleError(t)
+					default:
+						utilruntime.HandleError(fmt.Errorf("%v", res))
+					}
+				}
+			}()
+		}()
+
+		postTimeoutFn()
 		tw.timeout(err)
 	}
 }
@@ -206,15 +244,17 @@ func (tw *baseTimeoutWriter) timeout(err *apierrors.StatusError) {
 		// no way to timeout the HTTP request at the point. We have to shutdown
 		// the connection for HTTP1 or reset stream for HTTP2.
 		//
-		// Note from: Brad Fitzpatrick
-		// if the ServeHTTP goroutine panics, that will do the best possible thing for both
-		// HTTP/1 and HTTP/2. In HTTP/1, assuming you're replying with at least HTTP/1.1 and
-		// you've already flushed the headers so it's using HTTP chunking, it'll kill the TCP
-		// connection immediately without a proper 0-byte EOF chunk, so the peer will recognize
-		// the response as bogus. In HTTP/2 the server will just RST_STREAM the stream, leaving
-		// the TCP connection open, but resetting the stream to the peer so it'll have an error,
-		// like the HTTP/1 case.
-		panic(errConnKilled)
+		// Note from the golang's docs:
+		// If ServeHTTP panics, the server (the caller of ServeHTTP) assumes
+		// that the effect of the panic was isolated to the active request.
+		// It recovers the panic, logs a stack trace to the server error log,
+		// and either closes the network connection or sends an HTTP/2
+		// RST_STREAM, depending on the HTTP protocol. To abort a handler so
+		// the client sees an interrupted response but the server doesn't log
+		// an error, panic with the value ErrAbortHandler.
+		//
+		// We are throwing http.ErrAbortHandler deliberately so that a client is notified and to suppress a not helpful stacktrace in the logs
+		panic(http.ErrAbortHandler)
 	}
 }
 

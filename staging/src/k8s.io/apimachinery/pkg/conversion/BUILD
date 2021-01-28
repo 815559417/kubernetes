@@ -13,11 +13,6 @@ go_test(
         "helper_test.go",
     ],
     embed = [":go_default_library"],
-    deps = [
-        "//vendor/github.com/google/gofuzz:go_default_library",
-        "//vendor/github.com/spf13/pflag:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/util/diff:go_default_library",
-    ],
 )
 
 go_library(
@@ -28,8 +23,9 @@ go_library(
         "doc.go",
         "helper.go",
     ],
+    importmap = "k8s.io/kubernetes/vendor/k8s.io/apimachinery/pkg/conversion",
     importpath = "k8s.io/apimachinery/pkg/conversion",
-    deps = ["//vendor/k8s.io/apimachinery/third_party/forked/golang/reflect:go_default_library"],
+    deps = ["//staging/src/k8s.io/apimachinery/third_party/forked/golang/reflect:go_default_library"],
 )
 
 filegroup(

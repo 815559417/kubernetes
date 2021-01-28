@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library")
 go_library(
     name = "go_default_library",
     srcs = [
+        "assertion_compare.go",
         "assertion_format.go",
         "assertion_forward.go",
         "assertions.go",
@@ -11,11 +12,13 @@ go_library(
         "forward_assertions.go",
         "http_assertions.go",
     ],
+    importmap = "k8s.io/kubernetes/vendor/github.com/stretchr/testify/assert",
     importpath = "github.com/stretchr/testify/assert",
     visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/davecgh/go-spew/spew:go_default_library",
         "//vendor/github.com/pmezard/go-difflib/difflib:go_default_library",
+        "//vendor/gopkg.in/yaml.v3:go_default_library",
     ],
 )
 

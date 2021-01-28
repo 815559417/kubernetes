@@ -1,3 +1,5 @@
+// +build !dockerless
+
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -27,9 +29,9 @@ import (
 	dockercontainer "github.com/docker/docker/api/types/container"
 	dockerfilters "github.com/docker/docker/api/types/filters"
 	dockerstrslice "github.com/docker/docker/api/types/strslice"
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/dockershim/libdocker"
 )
 
@@ -71,7 +73,7 @@ func (ds *dockerService) ListContainers(_ context.Context, r *runtimeapi.ListCon
 
 		converted, err := toRuntimeAPIContainer(&c)
 		if err != nil {
-			glog.V(4).Infof("Unable to convert docker to runtime API container: %v", err)
+			klog.V(4).Infof("Unable to convert docker to runtime API container: %v", err)
 			continue
 		}
 
@@ -79,6 +81,25 @@ func (ds *dockerService) ListContainers(_ context.Context, r *runtimeapi.ListCon
 	}
 
 	return &runtimeapi.ListContainersResponse{Containers: result}, nil
+}
+
+func (ds *dockerService) getContainerCleanupInfo(containerID string) (*containerCleanupInfo, bool) {
+	ds.cleanupInfosLock.RLock()
+	defer ds.cleanupInfosLock.RUnlock()
+	info, ok := ds.containerCleanupInfos[containerID]
+	return info, ok
+}
+
+func (ds *dockerService) setContainerCleanupInfo(containerID string, info *containerCleanupInfo) {
+	ds.cleanupInfosLock.Lock()
+	defer ds.cleanupInfosLock.Unlock()
+	ds.containerCleanupInfos[containerID] = info
+}
+
+func (ds *dockerService) clearContainerCleanupInfo(containerID string) {
+	ds.cleanupInfosLock.Lock()
+	defer ds.cleanupInfosLock.Unlock()
+	delete(ds.containerCleanupInfos, containerID)
 }
 
 // CreateContainer creates a new container in the given PodSandbox
@@ -114,8 +135,9 @@ func (ds *dockerService) CreateContainer(_ context.Context, r *runtimeapi.Create
 	if iSpec := config.GetImage(); iSpec != nil {
 		image = iSpec.Image
 	}
+	containerName := makeContainerName(sandboxConfig, config)
 	createConfig := dockertypes.ContainerCreateConfig{
-		Name: makeContainerName(sandboxConfig, config),
+		Name: containerName,
 		Config: &dockercontainer.Config{
 			// TODO: set User.
 			Entrypoint: dockerstrslice.StrSlice(config.Command),
@@ -136,11 +158,17 @@ func (ds *dockerService) CreateContainer(_ context.Context, r *runtimeapi.Create
 		},
 		HostConfig: &dockercontainer.HostConfig{
 			Binds: generateMountBindings(config.GetMounts()),
+			RestartPolicy: dockercontainer.RestartPolicy{
+				Name: "no",
+			},
 		},
 	}
 
 	hc := createConfig.HostConfig
-	ds.updateCreateConfig(&createConfig, config, sandboxConfig, podSandboxID, securityOptSeparator, apiVersion)
+	err = ds.updateCreateConfig(&createConfig, config, sandboxConfig, podSandboxID, securityOptSeparator, apiVersion)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update container create config: %v", err)
+	}
 	// Set devices for container.
 	devices := make([]dockercontainer.DeviceMapping, len(config.Devices))
 	for i, device := range config.Devices {
@@ -159,15 +187,33 @@ func (ds *dockerService) CreateContainer(_ context.Context, r *runtimeapi.Create
 
 	hc.SecurityOpt = append(hc.SecurityOpt, securityOpts...)
 
-	createResp, err := ds.client.CreateContainer(createConfig)
+	cleanupInfo, err := ds.applyPlatformSpecificDockerConfig(r, &createConfig)
 	if err != nil {
-		createResp, err = recoverFromCreationConflictIfNeeded(ds.client, createConfig, err)
+		return nil, err
+	}
+
+	createResp, createErr := ds.client.CreateContainer(createConfig)
+	if createErr != nil {
+		createResp, createErr = recoverFromCreationConflictIfNeeded(ds.client, createConfig, createErr)
 	}
 
 	if createResp != nil {
-		return &runtimeapi.CreateContainerResponse{ContainerId: createResp.ID}, nil
+		containerID := createResp.ID
+
+		if cleanupInfo != nil {
+			// we don't perform the clean up just yet at that could destroy information
+			// needed for the container to start (e.g. Windows credentials stored in
+			// registry keys); instead, we'll clean up when the container gets removed
+			ds.setContainerCleanupInfo(containerID, cleanupInfo)
+		}
+		return &runtimeapi.CreateContainerResponse{ContainerId: containerID}, nil
 	}
-	return nil, err
+
+	// the creation failed, let's clean up right away - we ignore any errors though,
+	// this is best effort
+	ds.performPlatformSpecificContainerCleanupAndLogErrors(containerName, cleanupInfo)
+
+	return nil, createErr
 }
 
 // getContainerLogPath returns the container log path specified by kubelet and the real
@@ -188,7 +234,7 @@ func (ds *dockerService) createContainerLogSymlink(containerID string) error {
 	}
 
 	if path == "" {
-		glog.V(5).Infof("Container %s log path isn't specified, will not create the symlink", containerID)
+		klog.V(5).Infof("Container %s log path isn't specified, will not create the symlink", containerID)
 		return nil
 	}
 
@@ -196,7 +242,7 @@ func (ds *dockerService) createContainerLogSymlink(containerID string) error {
 		// Only create the symlink when container log path is specified and log file exists.
 		// Delete possibly existing file first
 		if err = ds.os.Remove(path); err == nil {
-			glog.Warningf("Deleted previously existing symlink file: %q", path)
+			klog.Warningf("Deleted previously existing symlink file: %q", path)
 		}
 		if err = ds.os.Symlink(realPath, path); err != nil {
 			return fmt.Errorf("failed to create symbolic link %q to the container log file %q for container %q: %v",
@@ -205,14 +251,14 @@ func (ds *dockerService) createContainerLogSymlink(containerID string) error {
 	} else {
 		supported, err := ds.IsCRISupportedLogDriver()
 		if err != nil {
-			glog.Warningf("Failed to check supported logging driver by CRI: %v", err)
+			klog.Warningf("Failed to check supported logging driver by CRI: %v", err)
 			return nil
 		}
 
 		if supported {
-			glog.Warningf("Cannot create symbolic link because container log file doesn't exist!")
+			klog.Warningf("Cannot create symbolic link because container log file doesn't exist!")
 		} else {
-			glog.V(5).Infof("Unsupported logging driver by CRI")
+			klog.V(5).Infof("Unsupported logging driver by CRI")
 		}
 	}
 
@@ -274,10 +320,15 @@ func (ds *dockerService) RemoveContainer(_ context.Context, r *runtimeapi.Remove
 	if err != nil {
 		return nil, err
 	}
+	errors := ds.performPlatformSpecificContainerForContainer(r.ContainerId)
+	if len(errors) != 0 {
+		return nil, fmt.Errorf("failed to run platform-specific clean ups for container %q: %v", r.ContainerId, errors)
+	}
 	err = ds.client.RemoveContainer(r.ContainerId, dockertypes.ContainerRemoveOptions{RemoveVolumes: true, Force: true})
 	if err != nil {
 		return nil, fmt.Errorf("failed to remove container %q: %v", r.ContainerId, err)
 	}
+
 	return &runtimeapi.RemoveContainerResponse{}, nil
 }
 
@@ -317,7 +368,10 @@ func (ds *dockerService) ContainerStatus(_ context.Context, req *runtimeapi.Cont
 	// Convert the image id to a pullable id.
 	ir, err := ds.client.InspectImageByID(r.Image)
 	if err != nil {
-		return nil, fmt.Errorf("unable to inspect docker image %q while inspecting docker container %q: %v", r.Image, containerID, err)
+		if !libdocker.IsImageNotFoundError(err) {
+			return nil, fmt.Errorf("unable to inspect docker image %q while inspecting docker container %q: %v", r.Image, containerID, err)
+		}
+		klog.Warningf("ignore error image %q not found while inspecting docker container %q: %v", r.Image, containerID, err)
 	}
 	imageID := toPullableImageID(r.Image, ir)
 
@@ -382,7 +436,7 @@ func (ds *dockerService) ContainerStatus(_ context.Context, req *runtimeapi.Cont
 
 	labels, annotations := extractLabels(r.Config.Labels)
 	imageName := r.Config.Image
-	if len(ir.RepoTags) > 0 {
+	if ir != nil && len(ir.RepoTags) > 0 {
 		imageName = ir.RepoTags[0]
 	}
 	status := &runtimeapi.ContainerStatus{
@@ -423,4 +477,29 @@ func (ds *dockerService) UpdateContainerResources(_ context.Context, r *runtimea
 		return nil, fmt.Errorf("failed to update container %q: %v", r.ContainerId, err)
 	}
 	return &runtimeapi.UpdateContainerResourcesResponse{}, nil
+}
+
+func (ds *dockerService) performPlatformSpecificContainerForContainer(containerID string) (errors []error) {
+	if cleanupInfo, present := ds.getContainerCleanupInfo(containerID); present {
+		errors = ds.performPlatformSpecificContainerCleanupAndLogErrors(containerID, cleanupInfo)
+
+		if len(errors) == 0 {
+			ds.clearContainerCleanupInfo(containerID)
+		}
+	}
+
+	return
+}
+
+func (ds *dockerService) performPlatformSpecificContainerCleanupAndLogErrors(containerNameOrID string, cleanupInfo *containerCleanupInfo) []error {
+	if cleanupInfo == nil {
+		return nil
+	}
+
+	errors := ds.performPlatformSpecificContainerCleanup(cleanupInfo)
+	for _, err := range errors {
+		klog.Warningf("error when cleaning up after container %q: %v", containerNameOrID, err)
+	}
+
+	return errors
 }

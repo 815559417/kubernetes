@@ -17,32 +17,33 @@ limitations under the License.
 package devicemanager
 
 import (
+	"fmt"
 	"path"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
-	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1beta1"
+	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
-var (
-	esocketName = "mock.sock"
-)
+func esocketName() string {
+	return fmt.Sprintf("mock%d.sock", time.Now().UnixNano())
+}
 
 func TestNewEndpoint(t *testing.T) {
-	socket := path.Join("/tmp", esocketName)
+	socket := path.Join("/tmp", esocketName())
 
 	devs := []*pluginapi.Device{
 		{ID: "ADeviceId", Health: pluginapi.Healthy},
 	}
 
-	p, e := esetup(t, devs, socket, "mock", func(n string, a, u, r []pluginapi.Device) {})
+	p, e := esetup(t, devs, socket, "mock", func(n string, d []pluginapi.Device) {})
 	defer ecleanup(t, p, e)
 }
 
 func TestRun(t *testing.T) {
-	socket := path.Join("/tmp", esocketName)
+	socket := path.Join("/tmp", esocketName())
 
 	devs := []*pluginapi.Device{
 		{ID: "ADeviceId", Health: pluginapi.Healthy},
@@ -58,7 +59,7 @@ func TestRun(t *testing.T) {
 
 	callbackCount := 0
 	callbackChan := make(chan int)
-	callback := func(n string, a, u, r []pluginapi.Device) {
+	callback := func(n string, devices []pluginapi.Device) {
 		// Should be called twice:
 		// one for plugin registration, one for plugin update.
 		if callbackCount > 2 {
@@ -67,23 +68,24 @@ func TestRun(t *testing.T) {
 
 		// Check plugin registration
 		if callbackCount == 0 {
-			require.Len(t, a, 3)
-			require.Len(t, u, 0)
-			require.Len(t, r, 0)
+			require.Len(t, devices, 3)
+			require.Equal(t, devices[0].ID, devs[0].ID)
+			require.Equal(t, devices[1].ID, devs[1].ID)
+			require.Equal(t, devices[2].ID, devs[2].ID)
+			require.Equal(t, devices[0].Health, devs[0].Health)
+			require.Equal(t, devices[1].Health, devs[1].Health)
+			require.Equal(t, devices[2].Health, devs[2].Health)
 		}
 
 		// Check plugin update
 		if callbackCount == 1 {
-			require.Len(t, a, 1)
-			require.Len(t, u, 2)
-			require.Len(t, r, 1)
-
-			require.Equal(t, a[0].ID, updated[2].ID)
-			require.Equal(t, u[0].ID, updated[0].ID)
-			require.Equal(t, u[0].Health, updated[0].Health)
-			require.Equal(t, u[1].ID, updated[1].ID)
-			require.Equal(t, u[1].Health, updated[1].Health)
-			require.Equal(t, r[0].ID, devs[1].ID)
+			require.Len(t, devices, 3)
+			require.Equal(t, devices[0].ID, updated[0].ID)
+			require.Equal(t, devices[1].ID, updated[1].ID)
+			require.Equal(t, devices[2].ID, updated[2].ID)
+			require.Equal(t, devices[0].Health, updated[0].Health)
+			require.Equal(t, devices[1].Health, updated[1].Health)
+			require.Equal(t, devices[2].Health, updated[2].Health)
 		}
 
 		callbackCount++
@@ -102,28 +104,17 @@ func TestRun(t *testing.T) {
 	// Wait for the second callback to be issued.
 	<-callbackChan
 
-	e.mutex.Lock()
-	defer e.mutex.Unlock()
-
-	require.Len(t, e.devices, 3)
-	for _, dref := range updated {
-		d, ok := e.devices[dref.ID]
-
-		require.True(t, ok)
-		require.Equal(t, d.ID, dref.ID)
-		require.Equal(t, d.Health, dref.Health)
-	}
-
+	require.Equal(t, callbackCount, 2)
 }
 
 func TestAllocate(t *testing.T) {
-	socket := path.Join("/tmp", esocketName)
+	socket := path.Join("/tmp", esocketName())
 	devs := []*pluginapi.Device{
 		{ID: "ADeviceId", Health: pluginapi.Healthy},
 	}
 	callbackCount := 0
 	callbackChan := make(chan int)
-	p, e := esetup(t, devs, socket, "mock", func(n string, a, u, r []pluginapi.Device) {
+	p, e := esetup(t, devs, socket, "mock", func(n string, d []pluginapi.Device) {
 		callbackCount++
 		callbackChan <- callbackCount
 	})
@@ -169,23 +160,47 @@ func TestAllocate(t *testing.T) {
 	require.Equal(t, resp, respOut)
 }
 
-func TestGetDevices(t *testing.T) {
-	e := endpointImpl{
-		devices: map[string]pluginapi.Device{
-			"ADeviceId": {ID: "ADeviceId", Health: pluginapi.Healthy},
+func TestGetPreferredAllocation(t *testing.T) {
+	socket := path.Join("/tmp", esocketName())
+	callbackCount := 0
+	callbackChan := make(chan int)
+	p, e := esetup(t, []*pluginapi.Device{}, socket, "mock", func(n string, d []pluginapi.Device) {
+		callbackCount++
+		callbackChan <- callbackCount
+	})
+	defer ecleanup(t, p, e)
+
+	resp := &pluginapi.PreferredAllocationResponse{
+		ContainerResponses: []*pluginapi.ContainerPreferredAllocationResponse{
+			{DeviceIDs: []string{"device0", "device1", "device2"}},
 		},
 	}
-	devs := e.getDevices()
-	require.Len(t, devs, 1)
+
+	p.SetGetPreferredAllocFunc(func(r *pluginapi.PreferredAllocationRequest, devs map[string]pluginapi.Device) (*pluginapi.PreferredAllocationResponse, error) {
+		return resp, nil
+	})
+
+	go e.run()
+	// Wait for the callback to be issued.
+	select {
+	case <-callbackChan:
+		break
+	case <-time.After(time.Second):
+		t.FailNow()
+	}
+
+	respOut, err := e.getPreferredAllocation([]string{}, []string{}, -1)
+	require.NoError(t, err)
+	require.Equal(t, resp, respOut)
 }
 
 func esetup(t *testing.T, devs []*pluginapi.Device, socket, resourceName string, callback monitorCallback) (*Stub, *endpointImpl) {
-	p := NewDevicePluginStub(devs, socket)
+	p := NewDevicePluginStub(devs, socket, resourceName, false, false)
 
 	err := p.Start()
 	require.NoError(t, err)
 
-	e, err := newEndpointImpl(socket, resourceName, make(map[string]pluginapi.Device), callback)
+	e, err := newEndpointImpl(socket, resourceName, callback)
 	require.NoError(t, err)
 
 	return p, e

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright 2017 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +21,7 @@
 
 set -o errexit
 
-if diff -u test/conformance/testdata/conformance.txt test/conformance/conformance.txt; then
+if diff -u test/conformance/testdata/conformance.yaml test/conformance/conformance.yaml; then
   echo PASS
   exit 0
 fi
